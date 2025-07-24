@@ -1,0 +1,68 @@
+{
+  "llm": {
+    "primary_provider": "anthropic",
+    "model_type": "high_quality",
+    "providers": {
+      "openai": {
+        "models": {
+          "default": "gpt-4o-mini",
+          "high_quality": "gpt-4o",
+          "balanced": "gpt-4-turbo",
+          "budget": "gpt-3.5-turbo"
+        },
+        "temperature": 0.1,
+        "output_max_token_size": 16384
+      },
+      "anthropic": {
+        "models": {
+          "default": "claude-sonnet-4-20250514",
+          "high_quality": "claude-sonnet-4-20250514",
+          "balanced": "claude-3-5-sonnet-20241022",
+          "budget": "claude-3-haiku-20240307"
+        },
+        "temperature": 0.1,
+        "output_max_token_size": 64000
+      },
+      "gemini": {
+        "models": {
+          "default": "gemini-2.5-flash",
+          "high_quality": "gemini-2.5-pro",
+          "balanced": "gemini-2.5-flash",
+          "budget": "gemini-1.5-flash"
+        },
+        "temperature": 0.1,
+        "output_max_token_size": 8192
+      }
+    }
+  },
+  "parsing": {
+    "basic_algorithm": {
+      "batch_size": 32,
+      "max_queue_size": 128
+    },
+    "enhanced_algorithm": {
+      "batch_size": 8,
+      "max_queue_size": 50,
+      "attention_sink_size": 4,
+      "coherence_threshold": 0.3,
+      "similarity_model": "all-MiniLM-L6-v2"
+    },
+    "channel_algorithm": {
+      "max_context_tokens": 128000,
+      "reserve_tokens": 2000
+    }
+  },
+  "output": {
+    "json_file": "output/cases_{algorithm}.json",
+    "markdown_file": "output/cases_{algorithm}.md",
+    "comparison_file": "output/algorithm_comparison.md",
+    "include_full_conversations": true,
+    "max_message_length": 500
+  },
+  "performance": {
+    "track_token_usage": true,
+    "track_processing_time": true,
+    "enable_detailed_logging": false,
+    "max_concurrent_channels": 1
+  }
+}
