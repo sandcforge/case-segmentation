@@ -15,7 +15,7 @@ import re
 import argparse
 import random
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -106,8 +106,8 @@ class DataPreprocessor:
         print(f"  Found {len(channel_counts)} channels")
         return dict(channel_counts)
     
-    def select_demo_channels(self, channel_counts: Dict[str, int]) -> List[str]:
-        """Select 3 representative channels for demo mode"""
+    def select_r3_channels(self, channel_counts: Dict[str, int]) -> List[str]:
+        """Select 3 representative channels for r3 mode"""
         # Categorize channels by message count
         many_channels = []    # >50 messages
         medium_channels = []  # 10-50 messages
@@ -148,37 +148,62 @@ class DataPreprocessor:
             selected.append(selected_channel[0])
             print(f"  Selected 'few messages' channel: {selected_channel[1]} messages")
         
-        print(f"📋 Selected {len(selected)} channels for demo mode")
+        print(f"📋 Selected {len(selected)} channels for r3 mode")
         return selected
     
-    def process_csv(self, input_file: str, output_file: str, demo_mode: bool = False) -> ProcessingStats:
+    def select_kelvin_channels(self, channel_counts: Dict[str, int]) -> List[str]:
+        """Select specific channels for Kelvin mode"""
+        kelvin_channels = [
+            'sendbird_group_channel_215482988_c05f4430399a29e30820acdfef8a267d81a3400b',
+            'sendbird_group_channel_215482988_da7183281699b7999e2677616b1e2a0e12c6c224', 
+            'sendbird_group_channel_215482988_dac86e93e1a8af85e898adf1317edfc157fd42db'
+        ]
+        
+        selected = []
+        for channel_url in kelvin_channels:
+            if channel_url in channel_counts:
+                selected.append(channel_url)
+                print(f"  Selected Kelvin channel: {channel_counts[channel_url]} messages")
+            else:
+                print(f"  ⚠️ Kelvin channel not found: {channel_url[:50]}...")
+        
+        print(f"📋 Selected {len(selected)} channels for Kelvin mode")
+        return selected
+    
+    def process_csv(self, input_file: str, output_file: str, mode: str = None) -> ProcessingStats:
         """Process CSV file and create optimized output"""
         self.stats = ProcessingStats()
         self.stats.start_time = datetime.now()
+        self._mode = mode  # Store for statistics display
         
         print(f"🚀 Starting data preprocessing...")
         print(f"  Input: {input_file}")
         print(f"  Output: {output_file}")
-        print(f"  Demo mode: {'Yes' if demo_mode else 'No'}")
+        print(f"  Mode: {mode if mode else 'full dataset'}")
         
         # Required columns mapping (keep original field names for compatibility)
         required_columns = {
-            'message_id': 'message_id',
-            'type': 'type', 
-            'message': 'message',
-            'sender_id': 'sender_id',
+            'review': 'review',  # First column with blank values
             'created_time': 'created_time',
+            'sender_id': 'sender_id',
+            'message': 'message',
+            'message_id': 'message_id',
+            'type': 'type',
             'channel_url': 'channel_url',
             'file_url': 'file_url',
             'sender_type': 'sender_type'  # New column to be computed
         }
         
-        # Demo mode: analyze and select channels first
+        # Mode-based channel selection
         selected_channels = None
-        if demo_mode:
+        if mode:
             channel_counts = self.analyze_channels(input_file)
-            selected_channels = set(self.select_demo_channels(channel_counts))
-            self.stats.channels_selected = len(selected_channels)
+            if mode == 'kelvin':
+                selected_channels = set(self.select_kelvin_channels(channel_counts))
+            elif mode == 'r3':
+                selected_channels = set(self.select_r3_channels(channel_counts))
+            if selected_channels:
+                self.stats.channels_selected = len(selected_channels)
         
         # Process the CSV file
         processed_data = []
@@ -194,8 +219,8 @@ class DataPreprocessor:
                     print(f"  Processed {i} rows...")
                 
                 try:
-                    # Demo mode: filter by selected channels
-                    if demo_mode and selected_channels:
+                    # Mode-based channel filtering
+                    if mode and selected_channels:
                         channel_url = row.get('channel_url', '')
                         if channel_url not in selected_channels:
                             self.stats.filtered_rows += 1
@@ -206,7 +231,10 @@ class DataPreprocessor:
                     sender_id = row.get('sender_id', '')  # Get sender_id early for sender_type logic
                     
                     for csv_col, field_name in required_columns.items():
-                        if field_name == 'sender_type':
+                        if field_name == 'review':
+                            # Review column starts blank
+                            value = ""
+                        elif field_name == 'sender_type':
                             # Compute sender_type based on sender_id
                             value = "customer_service" if sender_id.startswith("psops") else "user"
                         else:
@@ -292,7 +320,8 @@ class DataPreprocessor:
         print(f"Channels found:           {self.stats.channels_found:,}")
         
         if self.stats.channels_selected > 0:
-            print(f"Channels selected (demo): {self.stats.channels_selected}")
+            mode_name = getattr(self, '_mode', 'unknown')
+            print(f"Channels selected ({mode_name}): {self.stats.channels_selected}")
         
         print(f"Processing time:          {duration:.2f} seconds")
         print(f"Rows per second:          {self.stats.total_rows / duration:.0f}")
@@ -325,10 +354,11 @@ def main():
                        help='Input CSV file path (default: assets/support_msg.csv)')
     parser.add_argument('--output', default='assets/preprocessed_support_msg.csv',
                        help='Output CSV file path (default: assets/preprocessed_support_msg.csv)')
-    parser.add_argument('--demo', action='store_true',
-                       help='Demo mode: select 3 representative channels (many/medium/few messages)')
+    parser.add_argument('--mode', choices=['r3', 'kelvin'],
+                       help='Processing mode: r3 (3 representative channels) or kelvin (specific channels)')
     
     args = parser.parse_args()
+    
     
     # Create preprocessor and process data
     preprocessor = DataPreprocessor()
@@ -337,7 +367,7 @@ def main():
         stats = preprocessor.process_csv(
             input_file=args.input,
             output_file=args.output,
-            demo_mode=args.demo
+            mode=args.mode
         )
         
         # Print statistics

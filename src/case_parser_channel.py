@@ -39,6 +39,7 @@ class Message:
     channel_url: str
     sender_type: str = ""  # customer_service or user
     review: str = ""  # review value from original CSV
+    file_url: str = ""  # file URL if message type is FILE
 
 
 @dataclass
@@ -160,7 +161,8 @@ class ChannelCaseParser:
                         timestamp=timestamp,
                         channel_url=row['channel_url'],
                         sender_type=row['sender_type'],
-                        review=row['review']
+                        review=row['review'],
+                        file_url=row.get('file_url', '')
                     )
                     channels[message.channel_url].append(message)
                     
@@ -267,11 +269,12 @@ class ChannelCaseParser:
         
         for i, msg in enumerate(messages, 1):
             # Content is already cleaned from preprocessing
-            formatted += f"Message {i}:\n"
-            formatted += f"Sender: {msg.sender_id}\n"
-            formatted += f"Sender Type: {msg.sender_type}\n"
-            formatted += f"Time: {msg.timestamp.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            formatted += f"Content: {msg.content}\n\n"
+            formatted += f"<message id=\"{i}\">\n"
+            formatted += f"<sender>{msg.sender_id}</sender>\n"
+            formatted += f"<sender_type>{msg.sender_type}</sender_type>\n"
+            formatted += f"<time>{msg.timestamp.strftime('%Y-%m-%d %H:%M:%S')}</time>\n"
+            formatted += f"<content>{msg.content}</content>\n"
+            formatted += f"</message>\n\n"
             
         return formatted
     
@@ -1148,8 +1151,8 @@ IMPORTANT: Return ONLY the JSON object, no other text.
         
         # Write CSV with all messages and their case assignments
         with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
-            # Define CSV columns with review before case_number
-            fieldnames = ['review', 'case_number', 'created_time', 'sender_id', 'message', 'channel_url', 'message_id', 'type']
+            # Define CSV columns with case_number first, then all original columns
+            fieldnames = ['case_number', 'review', 'created_time', 'sender_id', 'message', 'message_id', 'type', 'channel_url', 'file_url', 'sender_type']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             
             # Write header
@@ -1160,14 +1163,16 @@ IMPORTANT: Return ONLY the JSON object, no other text.
             for case in self.completed_cases:
                 for msg in case.messages:
                     writer.writerow({
-                        'review': msg.review,
                         'case_number': case.case_id,
+                        'review': msg.review,
                         'created_time': msg.timestamp.isoformat(),
                         'sender_id': msg.sender_id,
                         'message': msg.content,
-                        'channel_url': msg.channel_url,
                         'message_id': msg.message_id,
-                        'type': msg.message_type
+                        'type': msg.message_type,
+                        'channel_url': msg.channel_url,
+                        'file_url': msg.file_url,
+                        'sender_type': msg.sender_type
                     })
                     total_rows += 1
         
