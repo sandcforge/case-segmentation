@@ -17,7 +17,7 @@ import re
 import os
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import defaultdict
 from llm_provider import create_llm_manager
 from config_manager import get_config, get_llm_config, get_parsing_config, get_output_config
@@ -40,6 +40,7 @@ class Message:
     sender_type: str = ""  # customer_service or user
     review: str = ""  # review value from original CSV
     file_url: str = ""  # file URL if message type is FILE
+    round_columns: dict = field(default_factory=dict)  # Dictionary to store all round* columns
 
 
 @dataclass
@@ -153,6 +154,9 @@ class ChannelCaseParser:
                     # Use preprocessed content directly (already cleaned)
                     content = row['message']
                     
+                    # Extract all columns that start with "round"
+                    round_columns = {col: row.get(col, '') for col in row.keys() if col.startswith('round')}
+                    
                     message = Message(
                         message_id=row['message_id'],
                         message_type=row['type'],
@@ -162,7 +166,8 @@ class ChannelCaseParser:
                         channel_url=row['channel_url'],
                         sender_type=row['sender_type'],
                         review=row['review'],
-                        file_url=row.get('file_url', '')
+                        file_url=row.get('file_url', ''),
+                        round_columns=round_columns
                     )
                     channels[message.channel_url].append(message)
                     
@@ -645,6 +650,9 @@ class ChannelCaseParser:
         try:
             response = self.llm_manager.analyze_case_boundaries(prompt)
             
+            # Log ALL LLM interactions for debugging
+            self._log_llm_interaction(call_type, prompt, response, messages, success=True)
+            
             # Update statistics
             self.current_channel_stats.input_tokens += response.input_tokens
             self.current_channel_stats.output_tokens += response.output_tokens
@@ -729,6 +737,10 @@ All parsing strategies exhausted.
         except Exception as e:
             print(f"    ❌ {call_type} LLM call failed: {e}")
             
+            # Log failed LLM interactions
+            error_details = f"LLM API call exception: {str(e)}\nException type: {type(e).__name__}"
+            self._log_llm_interaction(call_type, prompt, e, messages, success=False, error_details=error_details)
+            
             # Check if exception has enhanced error response data
             error_response = getattr(e, 'error_response', None)
             
@@ -785,15 +797,67 @@ All parsing strategies exhausted.
         return True
     
     
+    def _log_llm_interaction(self, call_type: str, prompt: str, response, messages: List[Message] = None, 
+                            success: bool = True, error_details: str = "") -> str:
+        """Log every LLM interaction (both successful and failed) to debug_output/"""
+        if messages is None:
+            messages = []
+            
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        status = "success" if success else "error"
+        debug_filename = f"debug_output/llm_call_{call_type.replace(' ', '_')}_{status}_{timestamp}.txt"
+        
+        try:
+            os.makedirs("debug_output", exist_ok=True)
+            
+            with open(debug_filename, 'w', encoding='utf-8') as debug_file:
+                debug_file.write(f"=== LLM INTERACTION LOG ===\n")
+                debug_file.write(f"Timestamp: {datetime.now().isoformat()}\n")
+                debug_file.write(f"Call Type: {call_type}\n")
+                debug_file.write(f"Status: {status.upper()}\n")
+                debug_file.write(f"Message Count: {len(messages)}\n")
+                debug_file.write(f"Channel URL: {messages[0].channel_url if messages else 'Unknown'}\n")
+                
+                if hasattr(response, 'model'):
+                    debug_file.write(f"Model: {response.model}\n")
+                    debug_file.write(f"Provider: {response.provider}\n")
+                    debug_file.write(f"Input Tokens: {response.input_tokens}\n")
+                    debug_file.write(f"Output Tokens: {response.output_tokens}\n")
+                    debug_file.write(f"Processing Time: {response.processing_time:.2f}s\n")
+                
+                if error_details:
+                    debug_file.write(f"\n=== ERROR DETAILS ===\n")
+                    debug_file.write(f"{error_details}\n")
+                
+                debug_file.write(f"\n=== FULL PROMPT ===\n")
+                debug_file.write(prompt)
+                
+                if hasattr(response, 'content'):
+                    debug_file.write(f"\n\n=== FULL RESPONSE ===\n")
+                    debug_file.write(f"Response length: {len(response.content)} characters\n\n")
+                    debug_file.write(response.content)
+                
+                if messages:
+                    debug_file.write(f"\n\n=== MESSAGE SAMPLE (First 3) ===\n")
+                    for i, msg in enumerate(messages[:3]):
+                        debug_file.write(f"Message {i+1}: [{msg.sender_id}] {msg.content[:100]}...\n")
+            
+            print(f"    🔍 LLM interaction logged: {debug_filename}")
+            return debug_filename
+            
+        except Exception as debug_err:
+            print(f"    ⚠️ Failed to log LLM interaction: {debug_err}")
+            return ""
+
     def _create_debug_dump(self, error_type: str, call_type: str, messages: List[Message], 
                           prompt: str = "", response_content: str = "", error_details: str = "", 
                           additional_context: Dict[str, Any] = None) -> str:
         """Create comprehensive debug dump file for troubleshooting"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        debug_filename = f"debug/{error_type}_{call_type.replace(' ', '_')}_{timestamp}.txt"
+        debug_filename = f"debug_output/{error_type}_{call_type.replace(' ', '_')}_{timestamp}.txt"
         
         try:
-            os.makedirs("debug", exist_ok=True)
+            os.makedirs("debug_output", exist_ok=True)
             
             with open(debug_filename, 'w', encoding='utf-8') as debug_file:
                 debug_file.write(f"=== {error_type.upper()} DEBUG DUMP ===\n")
@@ -843,7 +907,7 @@ All parsing strategies exhausted.
             print(f"    ⚠️ Failed to create debug dump: {debug_err}")
             return ""
 
-    def retry_llm_for_json(self, messages: List[Message], original_response: str) -> Dict[str, Any]:
+    def retry_llm_for_json(self, messages: List[Message], original_response: str = "") -> Dict[str, Any]:
         """Retry LLM with more explicit JSON formatting instructions"""
         print("  🔄 Retrying LLM with explicit JSON format request...")
         
@@ -873,6 +937,10 @@ IMPORTANT: Return ONLY the JSON object, no other text.
         
         try:
             response = self.llm_manager.analyze_case_boundaries(prompt)
+            
+            # Log retry LLM interactions
+            self._log_llm_interaction("json_retry", prompt, response, messages, success=True)
+            
             result = json.loads(response.content)
             
             if self.validate_llm_response(result):
@@ -886,6 +954,11 @@ IMPORTANT: Return ONLY the JSON object, no other text.
                 
         except Exception as e:
             print(f"  ❌ Retry failed: {e}")
+            
+            # Log failed retry attempts
+            error_details = f"Retry exception: {str(e)}\nException type: {type(e).__name__}"
+            self._log_llm_interaction("json_retry", prompt, e, messages, success=False, error_details=error_details)
+            
             self._create_debug_dump("retry_failed", "json_retry", messages, 
                                   prompt, "", f"Retry exception: {str(e)}")
             return None
@@ -1149,10 +1222,20 @@ IMPORTANT: Return ONLY the JSON object, no other text.
         print(f"📄 Exporting CSV with case numbers...")
         print(f"  📁 Output file: {filepath}")
         
+        # Collect all round column names from all messages
+        round_column_names = set()
+        for case in self.completed_cases:
+            for msg in case.messages:
+                if msg.round_columns:
+                    round_column_names.update(msg.round_columns.keys())
+        
+        # Sort round column names for consistent ordering
+        round_column_names = sorted(round_column_names)
+        
         # Write CSV with all messages and their case assignments
         with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
-            # Define CSV columns with case_number first, then all original columns
-            fieldnames = ['case_number', 'review', 'created_time', 'sender_id', 'message', 'message_id', 'type', 'channel_url', 'file_url', 'sender_type']
+            # Define CSV columns with case_number first, then round columns, then all original columns
+            fieldnames = ['case_number'] + round_column_names + ['review', 'created_time', 'sender_id', 'message', 'message_id', 'type', 'channel_url', 'file_url', 'sender_type']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             
             # Write header
@@ -1162,7 +1245,8 @@ IMPORTANT: Return ONLY the JSON object, no other text.
             total_rows = 0
             for case in self.completed_cases:
                 for msg in case.messages:
-                    writer.writerow({
+                    # Base row data
+                    row_data = {
                         'case_number': case.case_id,
                         'review': msg.review,
                         'created_time': msg.timestamp.isoformat(),
@@ -1173,7 +1257,13 @@ IMPORTANT: Return ONLY the JSON object, no other text.
                         'channel_url': msg.channel_url,
                         'file_url': msg.file_url,
                         'sender_type': msg.sender_type
-                    })
+                    }
+                    
+                    # Add round columns data
+                    for round_col in round_column_names:
+                        row_data[round_col] = msg.round_columns.get(round_col, '') if msg.round_columns else ''
+                    
+                    writer.writerow(row_data)
                     total_rows += 1
         
         print(f"✅ Exported {total_rows} messages with case assignments to {filepath}")
