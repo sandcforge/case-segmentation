@@ -6,7 +6,8 @@
       "Bash(pip install:*)",
       "Bash(python:*)",
       "Bash(mv:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(awk:*)"
     ],
     "deny": []
   }

@@ -51,9 +51,7 @@ ehthumbs.db
 Thumbs.db
 
 # Data files (sensitive customer data)
-assets/support_msg.csv
-assets/sample_support_msg.csv
-assets/*_backup.csv
+assets/*.csv
 
 # Generated outputs
 output/

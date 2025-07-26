@@ -40,6 +40,7 @@ class Message:
     sender_type: str = ""  # customer_service or user
     review: str = ""  # review value from original CSV
     file_url: str = ""  # file URL if message type is FILE
+    real_sender_id: str = ""  # real sender ID from original CSV
     round_columns: dict = field(default_factory=dict)  # Dictionary to store all round* columns
 
 
@@ -167,6 +168,7 @@ class ChannelCaseParser:
                         sender_type=row['sender_type'],
                         review=row['review'],
                         file_url=row.get('file_url', ''),
+                        real_sender_id=row.get('real_sender_id', ''),
                         round_columns=round_columns
                     )
                     channels[message.channel_url].append(message)
@@ -197,6 +199,24 @@ class ChannelCaseParser:
         """Extract JSON from LLM response that may contain extra text"""
         # Clean the response first
         cleaned = response_text.strip()
+        
+        # First, try to extract content from <output></output> tags
+        output_pattern = re.compile(r'<output>\s*(.*?)\s*</output>', re.DOTALL | re.IGNORECASE)
+        output_match = output_pattern.search(cleaned)
+        
+        if output_match:
+            # Extract content from output tags and process it
+            output_content = output_match.group(1).strip()
+            print("  🎯 Found content in <output></output> tags")
+            
+            # Try to parse the output content as JSON
+            try:
+                # Check if it's already clean JSON
+                json.loads(output_content)
+                return output_content
+            except json.JSONDecodeError:
+                # If not, continue with extraction methods below on the output content
+                cleaned = output_content
         
         # Try to find JSON block between { and } (including nested braces)
         brace_count = 0
@@ -543,7 +563,7 @@ class ChannelCaseParser:
         if was_truncated:
             truncation_note = "⚠️ NOTE: This conversation was truncated due to length limits. The last case may be incomplete.\n\n"
         
-        prompt = f"""
+        prompt1 = f"""
         ✦ You are an expert conversation analyst specializing in customer service interaction segmentation. Your task is to analyze this customer support conversation and identify distinct cases based on comprehensive boundary detection criteria.
 
         ## Conversation Analysis Framework
@@ -631,12 +651,57 @@ class ChannelCaseParser:
                     "confidence": 0.9
                 }}
             ],
-            "analysis": "Brief explanation of your segmentation decisions and key boundary indicators identified",
+            "analysis": "Comprehensive explanation incorporating business logic, customer journey insights, and boundary reasoning based on the 6-step systematic analysis",
             "total_messages_analyzed": {len(messages)}
         }}
+        </output>
+        """
+    
+        prompt = f"""
 
-        **CRITICAL**: Return ONLY the JSON object. No additional text, explanations, or formatting.
-        If no distinct cases can be identified, return empty array for complete_cases.
+        Analyze customer service conversations and segment them into separate cases by topic.
+
+        Segmentation Rules:
+        1. Clear topic change → New segment
+        2. Customer says "also", "another question", "by the way" → New segment  
+        3. New question after problem resolution → New segment
+        4. 24+ hour gap → New segment
+
+        Do NOT segment for:
+        - Follow-up clarifications on same issue
+        - Polite responses like "thank you"
+        - Information confirmations
+
+        <thinking>
+        Step 1: Read through the entire conversation chronologically to understand overall flow
+        Step 2: Identify main topics and issues discussed throughout the conversation
+        Step 3: Mark potential segment boundaries based on clear topic changes
+        Step 4: Check for explicit transition signals ("also", "another question", "by the way")
+        Step 5: Look for resolution points followed by new questions or issues
+        Step 6: Evaluate time gaps and assess whether they indicate natural conversation breaks
+        Step 7: Validate that each segment represents a coherent, actionable case
+        Step 8: Apply business logic to ensure segments make sense for case management
+        </thinking>
+
+
+        **CONVERSATION TO ANALYZE:**
+        {truncation_note}{self.format_conversation_for_llm(messages, was_truncated)}
+
+        Output segmentation results in JSON format:
+        <output>
+        {{
+            "complete_cases": [
+                {{
+                    "start_message": 1,
+                    "end_message": 8,
+                    "summary": "Brief description of the issue, actions taken, and resolution status",
+                    "confidence": 0.9
+                }}
+            ],
+            "analysis": "Comprehensive explanation incorporating business logic, customer journey insights, and boundary reasoning based on the systematic analysis above",
+            "total_messages_analyzed": [total_number_of_messages]
+        }}
+        </output>
         """
         
         return self._execute_llm_call(prompt, "initial analysis", messages)
@@ -1235,7 +1300,7 @@ IMPORTANT: Return ONLY the JSON object, no other text.
         # Write CSV with all messages and their case assignments
         with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
             # Define CSV columns with case_number first, then round columns, then all original columns
-            fieldnames = ['case_number'] + round_column_names + ['review', 'created_time', 'sender_id', 'message', 'message_id', 'type', 'channel_url', 'file_url', 'sender_type']
+            fieldnames = ['case_number'] + round_column_names + ['review', 'created_time', 'sender_id', 'real_sender_id', 'message', 'message_id', 'type', 'channel_url', 'file_url', 'sender_type']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             
             # Write header
@@ -1251,6 +1316,7 @@ IMPORTANT: Return ONLY the JSON object, no other text.
                         'review': msg.review,
                         'created_time': msg.timestamp.isoformat(),
                         'sender_id': msg.sender_id,
+                        'real_sender_id': msg.real_sender_id,
                         'message': msg.content,
                         'message_id': msg.message_id,
                         'type': msg.message_type,

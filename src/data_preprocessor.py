@@ -97,7 +97,7 @@ class DataPreprocessor:
                     print(f"  Analyzed {i} rows...")
                 
                 try:
-                    channel_url = row.get('channel_url', '')
+                    channel_url = row.get('Channel URL', '')
                     if channel_url:
                         channel_counts[channel_url] += 1
                 except Exception:
@@ -181,16 +181,17 @@ class DataPreprocessor:
         print(f"  Output: {output_file}")
         print(f"  Mode: {mode if mode else 'full dataset'}")
         
-        # Required columns mapping (keep original field names for compatibility)
+        # Required columns mapping (map from original CSV column names to output names)
         required_columns = {
             'review': 'review',  # First column with blank values
-            'created_time': 'created_time',
-            'sender_id': 'sender_id',
-            'message': 'message',
-            'message_id': 'message_id',
-            'type': 'type',
-            'channel_url': 'channel_url',
-            'file_url': 'file_url',
+            'Created Time': 'created_time',
+            'Sender ID': 'sender_id',
+            'Real Sender ID': 'real_sender_id',
+            'Message': 'message',
+            'Message ID': 'message_id',
+            'Type': 'type',
+            'Channel URL': 'channel_url',
+            'File URL': 'file_url',
             'sender_type': 'sender_type'  # New column to be computed
         }
         
@@ -221,14 +222,14 @@ class DataPreprocessor:
                 try:
                     # Mode-based channel filtering
                     if mode and selected_channels:
-                        channel_url = row.get('channel_url', '')
+                        channel_url = row.get('Channel URL', '')
                         if channel_url not in selected_channels:
                             self.stats.filtered_rows += 1
                             continue
                     
                     # Extract and validate required fields
                     extracted_row = {}
-                    sender_id = row.get('sender_id', '')  # Get sender_id early for sender_type logic
+                    sender_id = row.get('Sender ID', '')  # Get sender_id early for sender_type logic
                     
                     for csv_col, field_name in required_columns.items():
                         if field_name == 'review':
