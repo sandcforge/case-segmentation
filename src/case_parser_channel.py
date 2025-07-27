@@ -657,7 +657,7 @@ class ChannelCaseParser:
         </output>
         """
     
-        prompt = f"""
+        prompt2 = f"""
 
         Analyze customer service conversations and segment them into separate cases by topic.
 
@@ -702,6 +702,117 @@ class ChannelCaseParser:
             "total_messages_analyzed": [total_number_of_messages]
         }}
         </output>
+        """
+        
+        prompt = f"""
+# CUSTOMER SERVICE CONVERSATION CASE SEGMENTATION
+
+## ROLE & OBJECTIVE
+You are an expert conversation analyst specializing in customer service case segmentation. Your task is to analyze a continuous stream of customer service messages and segment them into distinct "cases" based on topic changes and conversation flow interruptions.
+
+## CONVERSATION DATA
+<csv_content>
+{self.format_conversation_for_llm(messages, was_truncated)}
+</csv_content>
+
+## DATA STRUCTURE
+**Focus on these key columns:**
+- **created_time**: Message timestamp (YYYY-MM-DDTHH:MM:SS format)
+- **sender_id**: Unique identifier for the message sender
+- **message**: The actual message content
+- **sender_type**: Either "customer_service" or "user"
+
+*Note: Ignore all other columns in your analysis.*
+
+---
+
+## SEGMENTATION METHODOLOGY: Attention Queue Processing
+
+### STEP-BY-STEP PROCESS:
+
+**1. INITIALIZE** → Start with an attention queue containing the first 5-10 messages
+
+**2. ANALYZE BATCH** → For the current message batch in your queue, determine:
+   - Is the current topic/conversation thread completed?
+   - Should this batch end a case, or continue gathering messages?
+
+**3. DECISION BRANCHING:**
+   
+   **IF TOPIC IS COMPLETED:**
+   - ✅ Finalize the current case
+   - 📝 Create case summary
+   - 🗑️ Remove completed case messages from queue
+   - ➕ Load next 5-10 messages into queue
+   
+   **IF TOPIC CONTINUES:**
+   - ➕ Add more messages to the current queue
+   - 🔄 Re-analyze the expanded batch
+
+**4. REPEAT** → Continue until all messages are processed
+
+---
+
+## ANALYSIS FRAMEWORK
+
+For each potential case boundary, conduct this structured analysis:
+
+<case_segmentation_analysis>
+**1. Current batch:** [List message numbers currently in your attention queue]
+
+**2. Time gap assessment:** [Note any significant time gaps between messages and their implications]
+
+**3. Topic continuity indicators:** [Identify words/phrases that suggest the conversation continues the same topic]
+
+**4. Topic change indicators:** [Identify words/phrases that signal a new topic or case beginning]
+
+**5. Context analysis:** [Evaluate message context, flow, and conversation coherence]
+
+**6. Decision:** [STATE: "COMPLETE CURRENT CASE" or "CONTINUE GATHERING MESSAGES"]
+
+**7. Confidence level:** [Rate 1-10, where 10 = completely certain about the boundary decision]
+
+**8. Justification:** [Provide clear reasoning for your segmentation decision]
+</case_segmentation_analysis>
+
+---
+
+## REQUIRED OUTPUT FORMAT
+
+After completing your systematic analysis, provide your final case segmentation in this **EXACT** JSON structure:
+
+<output>
+{{
+    "complete_cases": [
+        {{
+            "start_message": 1,
+            "end_message": 15,
+            "summary": "Brief summary of the case content and resolution",
+            "confidence": 0.9
+        }},
+        {{
+            "start_message": 16,
+            "end_message": 32,
+            "summary": "Brief summary of the next case content and resolution",
+            "confidence": 0.8
+        }}
+    ],
+    "analysis": "Comprehensive explanation of your segmentation decisions and reasoning",
+    "total_messages_analyzed": {len(messages)}
+}}
+</output>
+
+---
+
+## CRITICAL REQUIREMENTS
+
+⚠️ **STRICT ADHERENCE REQUIRED:**
+- Use the attention queue batch processing approach described above
+- Provide detailed <case_segmentation_analysis> for each potential boundary
+- Follow the exact JSON output format with proper timestamp formatting
+- Focus on natural topic changes and conversation interruptions
+- Ensure each case represents a coherent, complete interaction thread
+
+**Success Criteria:** Accurate case boundaries that reflect natural conversation flow and topic changes, processed systematically through the attention queue methodology.
         """
         
         return self._execute_llm_call(prompt, "initial analysis", messages)
