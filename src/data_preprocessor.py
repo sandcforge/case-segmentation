@@ -14,12 +14,13 @@ import csv
 import re
 import argparse
 import random
+import pandas as pd
 from datetime import datetime
 from typing import Dict, List, Optional
 from collections import defaultdict
 from dataclasses import dataclass
 
-# Pre-compiled regex patterns for performance (reused from case_parser_channel.py)
+# Pre-compiled regex patterns for performance (reused from channel_segmenter.py)
 CONTROL_CHAR_PATTERN = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
 WHITESPACE_PATTERN = re.compile(r'\s+')
 
@@ -171,28 +172,30 @@ class DataPreprocessor:
         return selected
     
     def process_csv(self, input_file: str, output_file: str, mode: str = None) -> ProcessingStats:
-        """Process CSV file and create optimized output"""
+        """Legacy method for CSV output - calls process_to_dataframe and saves to CSV"""
+        df = self.process_to_dataframe(input_file, mode)
+        df.to_csv(output_file, index=False)
+        return self.stats
+    
+    def process_to_dataframe(self, input_file: str, mode: str = None) -> pd.DataFrame:
+        """Process CSV file and return optimized DataFrame"""
         self.stats = ProcessingStats()
         self.stats.start_time = datetime.now()
         self._mode = mode  # Store for statistics display
         
-        print(f"🚀 Starting data preprocessing...")
-        print(f"  Input: {input_file}")
-        print(f"  Output: {output_file}")
-        print(f"  Mode: {mode if mode else 'full dataset'}")
+        print(f"📊 Processing data: {mode if mode else 'full dataset'}")
         
-        # Required columns mapping (map from original CSV column names to output names)
+        # Required columns mapping (use raw CSV column names directly)
         required_columns = {
-            'review': 'review',  # First column with blank values
-            'Created Time': 'created_time',
-            'Sender ID': 'sender_id',
-            'Real Sender ID': 'real_sender_id',
-            'Message': 'message',
-            'Message ID': 'message_id',
-            'Type': 'type',
-            'Channel URL': 'channel_url',
-            'File URL': 'file_url',
-            'sender_type': 'sender_type'  # New column to be computed
+            'Created Time': 'Created Time',
+            'Sender ID': 'Sender ID',
+            'Real Sender ID': 'Real Sender ID',
+            'Message': 'Message',
+            'Message ID': 'Message ID',
+            'Type': 'Type',
+            'Channel URL': 'Channel URL',
+            'File URL': 'File URL',
+            'Sender Type': 'Sender Type'  # Use the raw column name
         }
         
         # Mode-based channel selection
@@ -232,38 +235,40 @@ class DataPreprocessor:
                     sender_id = row.get('Sender ID', '')  # Get sender_id early for sender_type logic
                     
                     for csv_col, field_name in required_columns.items():
-                        if field_name == 'review':
-                            # Review column starts blank
-                            value = ""
-                        elif field_name == 'sender_type':
-                            # Compute sender_type based on sender_id
-                            value = "customer_service" if sender_id.startswith("psops") else "user"
-                        else:
-                            value = row.get(csv_col, '')
-                            
-                            # Special handling for different field types
-                            if field_name == 'message':
-                                # Clean message content
-                                value = self.clean_message_content(value)
-                            elif field_name == 'created_time':
-                                # Validate timestamp format
-                                if value:
-                                    try:
-                                        # Parse to validate format
-                                        datetime.fromisoformat(value.replace('Z', '+00:00'))
-                                    except Exception:
-                                        print(f"Warning: Invalid timestamp in row {i}: {value}")
-                                        value = ''
+                        value = row.get(csv_col, '')
+                        
+                        # Special handling for different field types
+                        if field_name == 'Message':
+                            # Clean message content
+                            value = self.clean_message_content(value)
+                        elif field_name == 'Created Time':
+                            # Validate timestamp format
+                            if value:
+                                try:
+                                    # Parse to validate format
+                                    datetime.fromisoformat(value.replace('Z', '+00:00'))
+                                except Exception:
+                                    print(f"Warning: Invalid timestamp in row {i}: {value}")
+                                    value = ''
+                        elif field_name == 'Sender Type':
+                            # Compute sender_type based on sender_id if column is empty
+                            if not value:
+                                value = "customer_service" if sender_id.startswith("psops") else "user"
                         
                         extracted_row[field_name] = value
                     
+                    # Copy all unused columns as-is without any processing
+                    for csv_col, value in row.items():
+                        if csv_col not in required_columns:
+                            extracted_row[csv_col] = value
+                    
                     # Skip rows with missing essential data
-                    if not extracted_row.get('message_id') or not extracted_row.get('channel_url'):
+                    if not extracted_row.get('Message ID') or not extracted_row.get('Channel URL'):
                         self.stats.filtered_rows += 1
                         continue
                     
                     # Track channel
-                    channel_url = extracted_row['channel_url']
+                    channel_url = extracted_row['Channel URL']
                     self.channel_message_counts[channel_url] += 1
                     
                     processed_data.append(extracted_row)
@@ -282,26 +287,38 @@ class DataPreprocessor:
         channels_data = defaultdict(list)
         
         for row in processed_data:
-            channels_data[row['channel_url']].append(row)
+            channels_data[row['Channel URL']].append(row)
         
         # Sort messages within each channel by timestamp
         sorted_data = []
         for channel_url, messages in channels_data.items():
             # Sort by timestamp
-            messages.sort(key=lambda x: x['created_time'] or '0')
+            messages.sort(key=lambda x: x['Created Time'] or '0')
             sorted_data.extend(messages)
         
-        # Write processed data to output file
-        print("💾 Writing processed data...")
-        fieldnames = list(required_columns.values())
+        # Create DataFrame from processed data
+        print("📊 Creating DataFrame...")
         
-        with open(output_file, 'w', encoding='utf-8', newline='') as file:
-            writer = csv.DictWriter(file, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(sorted_data)
+        # Convert timestamps to datetime objects
+        for row in sorted_data:
+            if row['Created Time']:
+                try:
+                    row['Created Time'] = pd.to_datetime(row['Created Time'])
+                except Exception:
+                    row['Created Time'] = pd.NaT
+        
+        df = pd.DataFrame(sorted_data)
+        
+        # Ensure column order - required columns first, then unused columns
+        required_fieldnames = list(required_columns.values())
+        unused_columns = [col for col in df.columns if col not in required_fieldnames]
+        all_fieldnames = required_fieldnames + unused_columns
+        df = df.reindex(columns=all_fieldnames)
         
         self.stats.end_time = datetime.now()
-        return self.stats
+        
+        print(f"✅ DataFrame created: {len(df)} rows, {len(df.columns)} columns")
+        return df
     
     def print_statistics(self):
         """Print comprehensive processing statistics"""
@@ -357,25 +374,43 @@ def main():
                        help='Output CSV file path (default: assets/preprocessed_support_msg.csv)')
     parser.add_argument('--mode', choices=['r3', 'kelvin'],
                        help='Processing mode: r3 (3 representative channels) or kelvin (specific channels)')
+    parser.add_argument('--dataframe', action='store_true',
+                       help='Return DataFrame instead of saving CSV (demo mode)')
     
     args = parser.parse_args()
-    
     
     # Create preprocessor and process data
     preprocessor = DataPreprocessor()
     
     try:
-        stats = preprocessor.process_csv(
-            input_file=args.input,
-            output_file=args.output,
-            mode=args.mode
-        )
-        
-        # Print statistics
-        preprocessor.print_statistics()
-        
-        print(f"\n✅ Preprocessing complete!")
-        print(f"📁 Output saved to: {args.output}")
+        if args.dataframe:
+            # Demonstrate DataFrame processing
+            df = preprocessor.process_to_dataframe(
+                input_file=args.input,
+                mode=args.mode
+            )
+            
+            # Print statistics
+            preprocessor.print_statistics()
+            
+            print(f"\n✅ DataFrame processing complete!")
+            print(f"📊 DataFrame shape: {df.shape}")
+            print(f"📊 Columns: {list(df.columns)}")
+            print(f"📊 Sample data:\n{df.head()}")
+            
+        else:
+            # Legacy CSV processing
+            stats = preprocessor.process_csv(
+                input_file=args.input,
+                output_file=args.output,
+                mode=args.mode
+            )
+            
+            # Print statistics
+            preprocessor.print_statistics()
+            
+            print(f"\n✅ Preprocessing complete!")
+            print(f"📁 Output saved to: {args.output}")
         
     except FileNotFoundError:
         print(f"❌ Error: Input file '{args.input}' not found")

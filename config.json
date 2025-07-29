@@ -1,6 +1,6 @@
 {
   "llm": {
-    "primary_provider": "anthropic",
+    "primary_provider": "openai",
     "model_type": "high_quality",
     "providers": {
       "openai": {
