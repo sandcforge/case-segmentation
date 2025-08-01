@@ -711,7 +711,7 @@ class ChannelSegmenter:
         </output>
         """
     
-        prompt2 = f"""
+        prompt = f"""
 
         Analyze customer service conversations and segment them into separate cases by topic.
 
@@ -758,7 +758,7 @@ class ChannelSegmenter:
         </output>
         """
         
-        prompt = f"""
+        prompt3 = f"""
 # CUSTOMER SERVICE CONVERSATION CASE SEGMENTATION
 
 ## ROLE & OBJECTIVE
@@ -1434,7 +1434,8 @@ IMPORTANT: Return ONLY the JSON object, no other text.
         """Export comprehensive segmentation summary across all channels"""
         if filepath is None:
             output_config = get_output_config("channel")
-            base_path = output_config.markdown_file.replace('.md', '_segmentation_summary.md')
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_path = output_config.markdown_file.replace('.md', f'_segmentation_summary_{timestamp}.md')
             filepath = base_path
         
         print(f"📋 Exporting segmentation summary...")

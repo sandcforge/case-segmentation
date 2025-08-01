@@ -16,14 +16,17 @@ python src/data_preprocessor.py --demo
 python src/data_preprocessor.py
 ```
 
-### Running the Case Parser
+### Running the Case Parser with Classification
 ```bash
-# Run case segmentation on preprocessed data
-python src/case_parser_channel.py
+# Run case segmentation AND classification on preprocessed data
+python src/channel_segmenter.py
 
-# Check outputs
+# Check outputs (now include classification data)
 ls output/                       # View generated reports
-cat output/cases_channel_segmentation_summary.md  # View latest results
+cat output/channel_segmentation_summary_*.md  # View latest results (with timestamp)
+
+# Check debug logs (includes classification debug info)
+ls debug_output/                 # View LLM interaction logs
 ```
 
 ### Development Setup
@@ -38,12 +41,14 @@ cp .env.example .env
 
 ## High-Level Architecture
 
-### Two-Stage Processing Pipeline
-The system uses a streamlined two-stage approach optimized for performance:
+### Three-Stage Processing Pipeline
+The system uses a comprehensive three-stage approach optimized for both performance and intelligence:
 
 1. **Data Preprocessing** (`src/data_preprocessor.py`) - Extracts necessary fields, cleans content, filters FILE messages, groups by channel, sorts by timestamp, and creates optimized CSV output.
 
-2. **Case Segmentation** (`src/case_parser_channel.py`) - Loads preprocessed data, performs full conversation analysis with LLM, implements token truncation, and generates comprehensive reports.
+2. **Case Segmentation** (`src/channel_segmenter.py`) - Loads preprocessed data, performs full conversation analysis with LLM, implements token truncation, and identifies case boundaries.
+
+3. **Case Classification** (`src/case_classifier.py`) - Automatically classifies each identified case using LLM analysis into a hierarchical taxonomy with 9 primary categories and 62+ secondary categories.
 
 ### Configuration Management System
 - **Secrets vs Settings**: API keys in `.env`, configuration in `config.json`
@@ -59,27 +64,58 @@ The `src/llm_provider.py` implements a factory pattern with `LLMManager` coordin
 
 ### Data Flow Architecture
 1. **CSV Loading**: Channel-grouped message loading with FILE message filtering
-2. **Queue Management**: Algorithm-specific message processing (incremental vs full)
-3. **LLM Analysis**: Unified prompt engineering with multi-strategy JSON response parsing
-4. **Case Extraction**: Message slicing with confidence scoring and force segmentation tracking
-5. **Multi-Format Export**: JSON, Markdown, and summary reports with comprehensive statistics
+2. **Full Conversation Analysis**: Complete context analysis with token truncation management
+3. **LLM Case Segmentation**: Unified prompt engineering with multi-strategy JSON response parsing
+4. **Case Extraction**: Message slicing with confidence scoring and boundary validation
+5. **LLM Case Classification**: Hierarchical taxonomy classification with confidence scoring and reasoning
+6. **Multi-Format Export**: JSON, CSV, and Markdown reports with comprehensive statistics and classification data
 
 ### Critical Implementation Details
 - **Full Conversation Processing**: Loads entire channel conversations for complete context analysis
 - **Token Truncation**: Binary search algorithm to fit conversations within 100K token limit
 - **Confidence Tracking**: All cases include LLM confidence scores (0.0-1.0) for quality assessment
-- **Comprehensive Analysis**: Single-pass analysis with built-in review and boundary validation
+- **Hierarchical Classification**: Automatic case classification with 9 primary and 62+ secondary categories
+- **Dual LLM Analysis**: Separate LLM calls for segmentation and classification with independent validation
+
+## Case Classification System
+
+### Hierarchical Taxonomy Structure
+The system automatically classifies cases into a comprehensive 9-category taxonomy:
+
+**Primary Categories (9):**
+- **Order** (11 subcategories): Status, Cancel, Update, Failure, Missing Coupon, Refund Status/Request/Full/Partial, Giveaway, Other
+- **Shipment** (18 subcategories): Status, Delay, Lost, Wrong Address, Reshipping, Local Pickup, Carrier Claim, Address/Carrier/Label Updates, Item Damaged/Missing/Wrong, Tracking Status/Invalid/Not Updating/False Completion, Other
+- **Payment** (13 subcategories): Status, Verification, Failure, Dispute, Chargeback, Method Update, Withdrawal Status/Delay/Method, Coupon Redemption/Failure, Pay by Credit, Other
+- **Tax and Fee** (6 subcategories): Sales Fee, Sales Tax, Invoice, Tax Information, Form 1099, Other
+- **User** (6 subcategories): Update Username/Email/Password, Account Delete/Recover, Other
+- **Seller** (8 subcategories): Application Request/Rejection/Additional Materials/Trust Review, Foundation Plan Enroll/Update/Cancel, Live Quota, Other
+- **App Functionality** (13 subcategories): Login, Logout, Settings, Live, Live Auction, Purge, Marketplace, Long-Form Auction, Bug, OBS Connection, Permission, Content Moderation, System Update, Other
+- **Referral and Promotion** (4 subcategories): Referral Bonus Information/Not Received, Credit, Gift, Other
+- **Other** (7 subcategories): Issue Resolved/Reopened, Feedback, Complaint, Copyright, Courtesy, Other
+
+### Classification Quality Metrics
+- **Confidence Scoring**: Each classification includes LLM confidence (0.0-1.0)
+- **Reasoning Provided**: LLM explains classification decisions for transparency
+- **Taxonomy Validation**: All classifications validated against predefined categories
+- **Error Handling**: Invalid categories rejected with debug logging
+
+### Classification Configuration
+- **Shared LLM Configuration**: Uses same provider/model settings as case segmentation
+- **Independent Processing**: Classification runs as separate LLM calls after segmentation
+- **Batch Processing**: Multiple cases classified efficiently in sequence
+- **Debug Logging**: All classification interactions logged to `debug_output/` directory
 
 ## Key Development Patterns
 
 ### Case Processing Pipeline
-The system follows this streamlined pattern:
+The system follows this comprehensive pattern:
 1. Load CSV → group by channel_url → sort by timestamp
 2. Full conversation analysis with token truncation as needed
 3. LLM boundary detection with multi-strategy JSON parsing fallbacks
 4. Case extraction with confidence tracking and quality assessment
-5. Statistics aggregation with property-based caching
-6. Export in multiple formats (JSON, CSV, Markdown)
+5. **LLM case classification** with hierarchical taxonomy validation
+6. Statistics aggregation with property-based caching (includes classification metrics)
+7. Export in multiple formats (JSON, CSV, Markdown) with classification data
 
 ### Configuration-First Development
 1. Configure API keys in `.env`
@@ -161,6 +197,13 @@ All parsers implement property-based caching for expensive operations:
 - **Pre-compiled regex patterns** for content cleaning (CONTROL_CHAR_PATTERN, WHITESPACE_PATTERN)  
 - **Property-based caching** for expensive statistics calculations
 - **FILE message filtering** reduces processing overhead by ~30% on typical datasets
+- **Efficient classification processing** with batch operations and taxonomy validation
+
+### Token Usage and Cost Considerations
+- **Dual LLM Calls**: Each case requires both segmentation and classification analysis
+- **Classification Overhead**: Additional ~2000-5000 tokens per case for classification
+- **Batch Efficiency**: Classification processes multiple cases in sequence to minimize overhead
+- **Token Optimization**: Reuses conversation content efficiently between segmentation and classification
 
 ## Working with the System
 
@@ -169,17 +212,51 @@ All parsers implement property-based caching for expensive operations:
 - **"Rate limit exceeded"**: Reduce batch_size in config.json or switch to budget models
 - **"Context length exceeded"**: Reduce max_context_tokens in config.json for automatic truncation
 - **"No cases found"**: Check sample data quality, verify message filtering, review conversation content
+- **"Classification failed"**: Check debug logs in `debug_output/` for LLM classification errors
+- **"Invalid category"**: LLM tried to use non-existent category; check classification debug logs
+- **"No LLM available for classification"**: Classification LLM initialization failed; check API keys and config
 
 ### Debug Information System
-The system automatically creates comprehensive debug dumps when LLM parsing fails:
+The system automatically creates comprehensive debug dumps for all LLM interactions:
 - **Location**: Debug files are saved in `debug_output/` directory
-- **Naming**: `{error_type}_{call_type}_{timestamp}.txt` format
+- **Naming**: `{operation_type}_{status}_{case_id}_{timestamp}.txt` format
 - **Contents**: Full LLM responses, prompts, error details, response metadata
-- **Types**: `api_call_failed`, `complete_parsing_failed`, `validation_failed`, etc.
-- **Usage**: Review debug files when troubleshooting LLM response parsing issues or API failures
+- **Segmentation Types**: `llm_call_initial_analysis_{success|error}`, `api_call_failed`, `complete_parsing_failed`, etc.
+- **Classification Types**: `classification_{success|error}_{case_id}`, includes taxonomy validation details
+- **Usage**: Review debug files when troubleshooting LLM response parsing issues, API failures, or classification errors
 
 ### Output Interpretation
+
+#### Case Segmentation Quality
 - **Confidence scores**: >0.8 high quality, 0.5-0.8 moderate, <0.5 review needed
 - **Truncation indicators**: Look for `truncated: true` in case data for incomplete conversations
 - **Token usage**: Monitor input/output tokens per channel for cost optimization
 - **Processing time**: Full conversation analysis optimized for accuracy and completeness
+
+#### Case Classification Results
+- **Primary/Secondary categories**: Hierarchical classification with 9 primary and 62+ secondary options
+- **Classification confidence**: Independent confidence scoring for each classification (0.0-1.0)
+- **Classification reasoning**: LLM provides explanation for each classification decision
+- **Missing classifications**: Cases without classification indicate LLM classification failure
+
+#### Enhanced Export Formats
+- **JSON Export**: Individual case classifications with reasoning, plus comprehensive classification statistics
+- **CSV Export**: New columns `primary_category`, `secondary_category`, `classification_confidence` for every message
+- **Classification Statistics**: Category distributions, confidence metrics, and classification success rates
+
+
+## Run Commands
+
+- **Run all scripts under the root folder**: Execute all Python scripts in the repository for comprehensive processing
+
+## IMPORTANT: Sound Notification
+
+After finishing responding to my request or running a command, run this command to notify me by sound:
+
+```bash
+afplay /System/Library/Sounds/Funk.aiff
+```
+
+## Sound Notification Strategy
+- Notify by sound after completing a task or running a command
+- Use system sound to provide audio feedback

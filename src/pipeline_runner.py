@@ -104,6 +104,10 @@ class PipelineRunner:
             print("-" * 40)
             print("Loading input file directly as DataFrame...")
             df_preprocessed = pd.read_csv(input_file)
+            
+            # Add review column if missing (for human review)
+            if 'review' not in df_preprocessed.columns:
+                df_preprocessed['review'] = ""
             self.stage_results['preprocessing'] = {
                 'input_rows': len(df_preprocessed),
                 'output_rows': len(df_preprocessed),
@@ -224,6 +228,10 @@ class PipelineRunner:
             print(f"💾 Updating source file {input_file}...")
             # Load original input file
             original_df = pd.read_csv(input_file)
+            
+            # Add review column if missing (for human review)
+            if 'review' not in original_df.columns:
+                original_df['review'] = ""
             
             # Add only Case Number and Category columns to original
             output_df = original_df.copy()

@@ -1,6 +1,6 @@
 {
   "llm": {
-    "primary_provider": "openai",
+    "primary_provider": "anthropic",
     "model_type": "high_quality",
     "providers": {
       "openai": {
@@ -54,7 +54,7 @@
   },
   "output": {
     "json_file": "output/cases_{algorithm}.json",
-    "markdown_file": "output/cases_{algorithm}.md",
+    "markdown_file": "output/{algorithm}.md",
     "comparison_file": "output/algorithm_comparison.md",
     "include_full_conversations": true,
     "max_message_length": 500
