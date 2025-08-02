@@ -711,7 +711,7 @@ class ChannelSegmenter:
         </output>
         """
     
-        prompt = f"""
+        prompt2 = f"""
 
         Analyze customer service conversations and segment them into separate cases by topic.
 
@@ -869,7 +869,8 @@ After completing your systematic analysis, provide your final case segmentation 
 **Success Criteria:** Accurate case boundaries that reflect natural conversation flow and topic changes, processed systematically through the attention queue methodology.
         """
         
-        return self._execute_llm_call(prompt, "initial analysis", messages)
+        final_prompt = prompt2
+        return self._execute_llm_call(final_prompt, "initial analysis", messages)
     
     
     def _execute_llm_call(self, prompt: str, call_type: str, messages: List[Message] = None) -> Dict[str, Any]:
