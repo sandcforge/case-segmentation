@@ -869,7 +869,189 @@ After completing your systematic analysis, provide your final case segmentation 
 **Success Criteria:** Accurate case boundaries that reflect natural conversation flow and topic changes, processed systematically through the attention queue methodology.
         """
         
-        final_prompt = prompt2
+        prompt4 = f"""
+            You are an expert customer service conversation analyst. Your task is to segment conversations into meaningful, actionable cases for quality analysis and case management.
+
+            ## Core Objective
+            Create segments that represent coherent business issues that can be independently tracked, resolved, and analyzed. Each segment should tell a complete story from problem identification to resolution or handoff.
+
+            ## Segmentation Philosophy
+            Apply the "Business Value Test": Would creating separate cases here improve customer service operations, tracking, or analysis? If yes, segment. If it would fragment a coherent customer journey, keep together.
+
+            ## Decision Framework (Apply Holistically)
+
+            ### **Strong Segmentation Signals** (High likelihood of new segment):
+            - **Semantic Topic Shift**: Customer introduces fundamentally different subject matter
+            - **Intent Change**: Shift from complaint → inquiry → request → feedback
+            - **Resolution Boundary**: Clear problem closure ("thanks, that's fixed") + new issue
+            - **Explicit Transitions**: "Also", "another question", "by the way", "separately"
+            - **Temporal Disconnection**: 24+ hours with contextual break
+            - **Service Escalation**: Handoff to different department/specialist
+
+            ### **Weak Segmentation Signals** (Evaluate in context):
+            - **Clarification Requests**: "What do you mean by..." on same topic
+            - **Process Steps**: Multi-step troubleshooting or information gathering  
+            - **Status Updates**: Progress reports on ongoing issue
+            - **Politeness Markers**: "Thank you", "please", routine courtesy
+            - **Detail Expansion**: Providing additional information for same problem
+
+            ### **Anti-Segmentation Factors** (Keep together):
+            - **Causal Dependencies**: Second issue caused by or related to first
+            - **Context Continuity**: Ongoing narrative that loses meaning if split
+            - **Process Completion**: Incomplete workflows or pending resolutions
+            - **Customer Experience Flow**: Natural conversation progression
+
+            ## Advanced Analysis Techniques
+
+            ### **Temporal Context Weighting**:
+            - **0-4 hours**: Strong continuity assumption
+            - **4-24 hours**: Moderate continuity, check semantic relationship
+            - **24+ hours**: Weak continuity, evaluate independent business value
+
+            ### **Semantic Coherence Assessment**:
+            Ask: "Do these messages address the same underlying customer need or business process?" If unclear, err toward keeping together.
+
+            ### **Business Logic Validation**:
+            For each potential segment, verify:
+            - Can this be assigned to a specialist?
+            - Does it have clear success/failure criteria?
+            - Would a manager understand the scope by reading just this segment?
+
+            ## Quality Assurance Checks
+
+            Before finalizing segmentation:
+            1. **Completeness**: Does each segment contain sufficient context to be actionable?
+            2. **Independence**: Can segments be resolved by different agents simultaneously?
+            3. **Customer Perspective**: Does segmentation respect the customer's problem-solving journey?
+            4. **Operational Value**: Will this segmentation improve case management or analysis?
+
+            <thinking>
+            Step 1: **Holistic Reading** - Understand the complete customer journey and business context
+            Step 2: **Intent Mapping** - Identify distinct customer goals and service delivery processes
+            Step 3: **Boundary Identification** - Mark potential splits using the decision framework above
+            Step 4: **Context Evaluation** - For each boundary, apply business value test and anti-segmentation factors
+            Step 5: **Temporal Analysis** - Weight time gaps against semantic and business continuity
+            Step 6: **Quality Validation** - Ensure each segment meets completeness and independence criteria
+            Step 7: **Final Optimization** - Adjust boundaries to maximize operational value while preserving customer experience coherence
+            </thinking>
+
+            **CONVERSATION TO ANALYZE:**
+            {truncation_note}{self.format_conversation_for_llm(messages, was_truncated)}
+
+            Output segmentation results in JSON format:
+
+            {{
+                "complete_cases": [
+                    {{
+                        "start_message": 1,
+                        "end_message": 8,
+                        "summary": "Brief description of the issue, actions taken, and resolution status",
+                        "confidence": 0.9
+                    }}
+                ],
+                "total_messages_analyzed": [total_number_of_messages]
+            }}        
+        """
+        
+        prompt5 = f"""
+You are an expert e-commerce customer service conversation analyst. Your task is to segment seller-support conversations into meaningful cases based on order context and business logic.
+
+## Conversation Context
+This is a conversation between ONE seller (sender_type="user") and customer service (sender_type="support") discussing various issues that may involve different buyers' orders or general business topics.
+
+## Input Data Structure
+Each message contains:
+- **message_id**: Unique message identifier for ordering
+- **sender**: Person's ID who sent the message
+- **sender_type**: "support" (platform customer service) or "user" (seller)
+- **time**: Message timestamp for temporal analysis
+- **content**: Actual message content
+
+## Core Segmentation Principle: Multi-Dimensional Business Logic
+
+### **Primary Segmentation Drivers (Always Create Separate Cases)**:
+- **Different Order Numbers**: Each order number represents a separate business transaction
+- **Different Buyer**: Different buyer(username, user id) require separate case tracking
+- **Different Business Process Types**: Claims vs refunds vs technical issues vs policy questions
+- **Different Urgency Levels**: Emergency technical issues vs routine inquiries
+
+### **Marketplace-Specific Business Logic**:
+
+#### **Seller Support Categories**:
+- **Order Management**: Address changes, cancellations, local pickup conversions
+- **Financial Issues**: Payouts, fees, reimbursements, chargebacks
+- **Shipping/Claims**: Lost packages, damage claims, delivery protection
+- **Platform Issues**: App bugs, data sync problems, account access
+- **Policy/Compliance**: Disputes, seller conduct, marketplace rules
+
+#### **Resolution Process Continuity**:
+- **Single Process**: Problem report → Investigation → Solution → Confirmation
+- **Multi-Stage Claims**: Initial claim → Evidence gathering → Review → Payout → Follow-up
+- **Escalation Chains**: Seller support → Supervisor → Engineering → Management
+
+### **Enhanced Decision Framework**:
+
+#### **Strong Segmentation Signals**:
+- **Order Number Change**: "About order #123" → "Regarding order #456"
+- **Process Type Change**: Shipping claim → App technical issue
+- **buyer Change**: Different buyer or its username mentioned
+- **Business Day Boundaries**: Cross-day issues unless active resolution
+- **Urgency Level Change**: Emergency technical issue + routine inquiry
+
+#### **Continuity Factors** (Keep Together):
+- **Same Order Lifecycle**: Order → Shipping → Delivery → Issue → Resolution
+- **Multi-Step Claims**: Claim submission → Evidence → Review → Payout
+- **Technical Issue Resolution**: Bug report → Troubleshooting → Fix → Verification
+- **Escalation Processes**: L1 support → L2 supervisor → Engineering
+
+#### **Time-Based Segmentation Rules**:
+- **Active Session (0-4 hours)**: Strong continuity for related issues
+- **Business Day Span (4-24 hours)**: Moderate continuity, check order relationship
+- **Multi-Day Issues (24+ hours)**: Evaluate business process continuity
+- **Long-term Claims (weeks/months)**: Maintain case continuity for ongoing processes
+
+### **Structured Data Analysis Approach**:
+
+#### **Temporal Analysis Enhancement**:
+- **Time Gap Calculation**: Use precise timestamps for interval analysis
+- **Business Hours Context**: Consider timezone and business day patterns
+- **Response Time Patterns**: Quick support responses vs delayed seller replies
+
+#### **Content-Context Integration**:
+- **Order Number Extraction**: Identify all order references in content
+- **Issue Type Classification**: Map content to business process categories
+- **Urgency Indicators**: Detect emergency language, escalation requests
+
+<thinking>
+Step 1: **Data Structure Validation** - Verify message ordering by time consistency
+Step 2: **Seller and Agent Identification** - Map sender IDs to roles and track multiple sellers
+Step 3: **Business Context Extraction** - Extract order numbers, buyer, issue types, and process stages
+Step 4: **Temporal Pattern Analysis** - Calculate time gaps and identify session boundaries
+Step 5: **Order-Process Mapping** - Group by order numbers and process categories
+Step 6: **Cross-Reference Validation** - Ensure sender continuity matches content context
+Step 7: **Business Logic Application** - Apply marketplace-specific segmentation rules
+Step 8: **Operational Optimization** - Create segments supporting efficient case management
+</thinking>
+
+### **CONVERSATION TO ANALYZE:**
+{truncation_note}{self.format_conversation_for_llm(messages, was_truncated)}
+
+### Output segmentation results in JSON format:
+
+{{
+    "complete_cases": [
+        {{
+            "start_message": 1,
+            "end_message": 8,
+            "summary": "Brief description of the issue, actions taken, and resolution status",
+            "confidence": 0.9
+        }}
+    ],
+    "total_messages_analyzed": [total_number_of_messages]
+}}
+
+        """
+        final_prompt = prompt5
         return self._execute_llm_call(final_prompt, "initial analysis", messages)
     
     
