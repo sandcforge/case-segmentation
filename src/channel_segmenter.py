@@ -12,7 +12,6 @@ This implements a whole-conversation approach:
 
 import csv
 import json
-import time
 import re
 import os
 import pandas as pd
@@ -28,6 +27,8 @@ CONTROL_CHAR_PATTERN = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
 WHITESPACE_PATTERN = re.compile(r'\s+')
 CODE_BLOCK_PATTERN = re.compile(r'```(?:json)?\s*(\{.*?\})\s*```', re.DOTALL | re.IGNORECASE)
 JSON_PATTERN = re.compile(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', re.DOTALL)
+
+
 
 
 @dataclass
@@ -58,7 +59,17 @@ class Case:
     duration_minutes: float = 0.0  # Case duration in minutes
     forced_ending: bool = False  # True if case was force-extracted due to queue overflow
     forced_starting: bool = False  # True if case starts after a force extraction
-    truncated: bool = False  # True if conversation was truncated due to length limits
+
+
+@dataclass
+class CaseReviewResult:
+    """Review result for case segmentation quality assessment"""
+    case_index: int  # Index of the case being reviewed
+    needs_split: bool  # Whether the case should be split further
+    confidence: float  # Reviewer confidence in the decision
+    reasoning: str  # Explanation for the decision
+    suggested_split_points: List[int] = field(default_factory=list)  # Message indices for splitting
+    review_iteration: int = 0  # Which review iteration this is from
 
 
 @dataclass
@@ -70,7 +81,9 @@ class ChannelStats:
     output_tokens: int
     llm_calls: int
     processing_time: float
-    was_truncated: bool = False
+    review_iterations: int = 0  # Number of review iterations performed
+    cases_reviewed: int = 0  # Number of cases that underwent review
+    cases_split: int = 0  # Number of cases that were split after review
 
 
 class ChannelSegmenter:
@@ -82,6 +95,8 @@ class ChannelSegmenter:
         parsing_config = get_parsing_config("channel")
         self.max_context_tokens = parsing_config.max_context_tokens
         self.reserve_tokens = parsing_config.reserve_tokens
+        self.review_enabled = getattr(parsing_config, 'review_enabled', False)
+        self.max_review_iterations = getattr(parsing_config, 'max_review_iterations', 3)
         
         # Get model_type from config if not specified
         if llm_model_type is None:
@@ -339,12 +354,9 @@ class ChannelSegmenter:
             print(f"Error cleaning message content: {e}")
             return "[invalid message content]"
     
-    def format_conversation_for_llm(self, messages: List[Message], was_truncated: bool = False) -> str:
+    def format_conversation_for_llm(self, messages: List[Message]) -> str:
         """Format entire conversation for LLM analysis"""
         formatted = "COMPLETE CONVERSATION:\n\n"
-        
-        if was_truncated:
-            formatted += "⚠️ NOTE: This conversation was truncated due to length limits.\n\n"
         
         for i, msg in enumerate(messages, 1):
             # Content is already cleaned from preprocessing
@@ -357,217 +369,9 @@ class ChannelSegmenter:
             
         return formatted
     
-    def truncate_conversation_to_fit(self, messages: List[Message]) -> tuple[List[Message], bool]:
-        """Truncate conversation to fit within token limits"""
-        # Calculate approximate prompt tokens (reserve for instructions)
-        available_tokens = self.max_context_tokens - self.reserve_tokens
-        
-        # Try with full conversation first
-        full_conversation = self.format_conversation_for_llm(messages)
-        total_tokens = self.count_tokens(full_conversation)
-        
-        if total_tokens <= available_tokens:
-            print(f"  📊 Full conversation fits: {total_tokens} tokens")
-            return messages, False
-        
-        print(f"  ⚠️ Conversation too long: {total_tokens} tokens > {available_tokens} limit")
-        print(f"  ✂️ Truncating conversation to fit token limit...")
-        
-        # Binary search to find maximum messages that fit
-        left, right = 1, len(messages)
-        best_count = 1
-        
-        while left <= right:
-            mid = (left + right) // 2
-            truncated_messages = messages[:mid]
-            truncated_conversation = self.format_conversation_for_llm(truncated_messages, was_truncated=True)
-            tokens = self.count_tokens(truncated_conversation)
-            
-            if tokens <= available_tokens:
-                best_count = mid
-                left = mid + 1
-            else:
-                right = mid - 1
-        
-        truncated_messages = messages[:best_count]
-        final_tokens = self.count_tokens(self.format_conversation_for_llm(truncated_messages, was_truncated=True))
-        print(f"  ✅ Truncated to {best_count} messages ({final_tokens} tokens)")
-        
-        return truncated_messages, True
     
-    def analyze_full_conversation_back(self, messages: List[Message], was_truncated: bool = False) -> Dict[str, Any]:
-        """Use LLM to analyze entire conversation for case boundaries"""
-        if not self.llm_manager:
-            print("  ⚠️ No LLM available - creating single case with note")
-            return {
-                "complete_cases": [{
-                    "start_message": 1,
-                    "end_message": len(messages),
-                    "summary": "No LLM analysis available - processed as single case",
-                    "confidence": 0.3
-                }],
-                "analysis": "No LLM provider available",
-                "total_messages_analyzed": len(messages)
-            }
-        
-        print(f"  🤖 Analyzing complete conversation with {len(messages)} messages...")
-        
-        truncation_note = ""
-        if was_truncated:
-            truncation_note = "⚠️ NOTE: This conversation was truncated due to length limits. The last case may be incomplete.\n\n"
-        
-        prompt = f"""
-        ✦ You are an expert AI assistant specializing in analyzing customer service interactions. Your task is to process and segment this continuous chat log into distinct customer service cases.
-
-        The conversation contains interactions between a support team and customers. You must identify natural start and end points of each distinct issue or topic discussed.
-
-        {truncation_note}{self.format_conversation_for_llm(messages, was_truncated)}
-
-        For each case you identify, provide these four fields:
-
-        1. **Start Message**: The message number where the case begins (when a new, distinct topic is introduced)
-        2. **End Message**: The message number where the case concludes (when issue is resolved, topic concluded, or conversation moves on)
-        3. **Summary**: A concise, one-to-two-sentence summary including the initial problem, key discussion points, and final resolution or status
-        4. **Confidence**: Your confidence level (0.9 = High, 0.7 = Medium, 0.5 = Low) that this represents a complete and distinct case
-
-        Instructions:
-        • Process the entire conversation in a single pass, leveraging your full context window
-        • A case begins when a new, distinct topic is introduced
-        • A case ends when the issue is resolved, clearly concluded, or conversation moves on without resolution
-        • A single case can span multiple messages and time periods
-        • If a topic is raised but not resolved in the log, note this in summary and assign Medium confidence (0.7)
-        • Be mindful that intermediate responses, status updates, and clarifications are part of the same case, not new cases
-
-        IMPORTANT: Return ONLY valid JSON, no other text or explanation.
-
-        Required JSON format:
-        {{
-            "complete_cases": [
-                {{
-                    "start_message": 1,
-                    "end_message": 8,
-                    "summary": "Customer reported delivery issue with order #12345. Support investigated tracking and confirmed package was delivered to correct address, providing photo evidence. Issue resolved.",
-                    "confidence": 0.9
-                }}
-            ],
-            "analysis": "Brief explanation of your segmentation decisions",
-            "total_messages_analyzed": {len(messages)}
-        }}
-
-        If no complete cases found, return empty array for complete_cases.
-        Return ONLY the JSON object, nothing else.
-        """
-        
-        try:
-            # Use LLM manager for analysis
-            response = self.llm_manager.analyze_case_boundaries(prompt)
-            
-            # Update statistics
-            self.current_channel_stats.input_tokens += response.input_tokens
-            self.current_channel_stats.output_tokens += response.output_tokens
-            self.current_channel_stats.llm_calls += 1
-            self.current_channel_stats.processing_time += response.processing_time
-            
-            print(f"  📊 LLM response: {response.input_tokens} input + {response.output_tokens} output tokens")
-            
-            # Enhanced JSON parsing with multiple strategies
-            try:
-                # Strategy 1: Direct JSON parsing
-                result = json.loads(response.content)
-                print("  ✅ Direct JSON parsing successful")
-                
-                # Validate the structure
-                if self.validate_llm_response(result):
-                    return result
-                else:
-                    print("  ⚠️ JSON structure invalid, missing complete_cases key")
-                    raise ValueError("Invalid JSON structure")
-            except (json.JSONDecodeError, ValueError) as err:
-                print(f"  ⚠️ Direct JSON parsing failed or invalid structure: {err}")
-                
-                try:
-                    # Strategy 2: Extract JSON from mixed text response
-                    extracted_json = self.extract_json_from_response(response.content)
-                    result = json.loads(extracted_json)
-                    print("  ✅ Successfully extracted JSON from mixed response")
-                    
-                    # Validate the structure
-                    if self.validate_llm_response(result):
-                        return result
-                    else:
-                        print("  ⚠️ Extracted JSON structure invalid")
-                        raise ValueError("Invalid JSON structure")
-                except (json.JSONDecodeError, ValueError):
-                    print(f"  ⚠️ JSON extraction failed, trying cleaning...")
-                    
-                    try:
-                        # Strategy 3: Clean control characters and retry
-                        cleaned_response = self.clean_message_content(response.content)
-                        extracted_json = self.extract_json_from_response(cleaned_response)
-                        result = json.loads(extracted_json)
-                        print("  ✅ Successfully parsed with cleaned extraction")
-                        
-                        # Validate the structure
-                        if self.validate_llm_response(result):
-                            return result
-                        else:
-                            print("  ⚠️ Cleaned JSON structure invalid")
-                            raise ValueError("Invalid JSON structure")
-                    except:
-                        print(f"  ❌ All JSON parsing strategies failed")
-                        print(f"  📝 Raw LLM response: {response.content[:300]}...")
-                        
-                        # DEBUG: Dump full response to file for analysis
-                        debug_filename = f"debug_llm_response_{int(time.time())}.txt"
-                        try:
-                            with open(debug_filename, 'w', encoding='utf-8') as debug_file:
-                                debug_file.write("=== LLM RESPONSE DEBUG DUMP ===\n")
-                                debug_file.write(f"Model: {response.model}\n")
-                                debug_file.write(f"Provider: {response.provider}\n")
-                                debug_file.write(f"Input tokens: {response.input_tokens}\n")
-                                debug_file.write(f"Output tokens: {response.output_tokens}\n")
-                                debug_file.write(f"Processing time: {response.processing_time:.2f}s\n")
-                                debug_file.write(f"Message count: {len(messages)}\n")
-                                debug_file.write(f"Truncated: {was_truncated}\n")
-                                debug_file.write("\n=== FULL RESPONSE CONTENT ===\n")
-                                debug_file.write(response.content)
-                                debug_file.write("\n\n=== PROMPT SENT ===\n")
-                                debug_file.write(prompt)
-                            print(f"  🔍 Debug response saved to: {debug_filename}")
-                        except Exception as debug_err:
-                            print(f"  ⚠️ Failed to save debug file: {debug_err}")
-                        
-                        # Strategy 4: Retry with explicit JSON format instructions
-                        retry_result = self.retry_llm_for_json(messages, response.content)
-                        if retry_result:
-                            return retry_result
-                        
-                        print("  ⚠️ Creating single case with parsing failure note")
-                        return {
-                            "complete_cases": [{
-                                "start_message": 1,
-                                "end_message": len(messages),
-                                "summary": "LLM response parsing failed after retry - processed as single case",
-                                "confidence": 0.2
-                            }],
-                            "analysis": "LLM JSON parsing failed after retry attempt",
-                            "total_messages_analyzed": len(messages)
-                        }
-            
-        except Exception as e:
-            print(f"LLM analysis error: {e}")
-            return {
-                "complete_cases": [{
-                    "start_message": 1,
-                    "end_message": len(messages),
-                    "summary": f"LLM analysis failed ({str(e)[:50]}) - processed as single case",
-                    "confidence": 0.1
-                }],
-                "analysis": f"LLM analysis exception: {e}",
-                "total_messages_analyzed": len(messages)
-            }
-    
-    def analyze_full_conversation(self, messages: List[Message], was_truncated: bool = False) -> Dict[str, Any]:
+   
+    def analyze_full_conversation(self, messages: List[Message]) -> Dict[str, Any]:
         """Use LLM to analyze conversation for case boundaries with built-in review"""
         if not self.llm_manager:
             print("  ⚠️ No LLM available - creating single case with note")
@@ -584,376 +388,8 @@ class ChannelSegmenter:
         
         print(f"  🤖 Analyzing complete conversation with {len(messages)} messages...")
         
-        # Perform single analysis with built-in review
-        result = self._perform_initial_analysis(messages, was_truncated)
-        
-        if result is None:
-            # Create fallback result when analysis fails
-            print("  ⚠️ Analysis failed, creating fallback single case")
-            result = {
-                "complete_cases": [{
-                    "start_message": 1,
-                    "end_message": len(messages),
-                    "summary": "LLM analysis failed - processed as single case",
-                    "confidence": 0.1
-                }],
-                "analysis": "LLM analysis failed",
-                "total_messages_analyzed": len(messages)
-            }
-        
-        # Calculate final confidence
-        cases = result.get("complete_cases", [])
-        if cases:
-            avg_confidence = sum(case.get("confidence", 0.0) for case in cases) / len(cases)
-            print(f"  🎯 Analysis complete: {len(cases)} cases, avg confidence: {avg_confidence:.3f}")
-        else:
-            print("  ⚠️ No cases identified in analysis")
-        
-        return result
-    
-    def _perform_initial_analysis(self, messages: List[Message], was_truncated: bool) -> Dict[str, Any]:
-        """Perform the initial LLM analysis (same as original method but with iteration tracking)"""
-        truncation_note = ""
-        if was_truncated:
-            truncation_note = "⚠️ NOTE: This conversation was truncated due to length limits. The last case may be incomplete.\n\n"
-        
-        prompt1 = f"""
-        ✦ You are an expert conversation analyst specializing in customer service interaction segmentation. Your task is to analyze this customer support conversation and identify distinct cases based on comprehensive boundary detection criteria.
-
-        ## Conversation Analysis Framework
-
-        **CONVERSATION TO ANALYZE:**
-        {truncation_note}{self.format_conversation_for_llm(messages, was_truncated)}
-
-        ## Detailed Boundary Identification Criteria
-
-        ### Primary Case Boundary Indicators:
-        1. **Topic Transitions**: Clear shifts in the subject matter or problem being discussed
-        2. **Participant Changes**: New customer joining conversation or handoff between support agents
-        3. **Temporal Gaps**: Significant time breaks that indicate conversation resumption (>30 minutes as guideline)
-        4. **Resolution Points**: Explicit confirmation that an issue has been resolved or closed
-        5. **New Issue Introduction**: Customer raises a completely different concern or problem
-
-        ### Secondary Indicators:
-        1. **Context Shifts**: Changes from troubleshooting to billing, technical to account issues, etc.
-        2. **Process Changes**: Shifts from initial inquiry to escalation, or from support to sales
-        3. **Reference Number Changes**: Different ticket/order/case numbers being discussed
-        4. **Communication Mode Shifts**: Phone to chat handoffs, different departments involved
-
-        ## Systematic Analysis Approach
-
-        ### Step 1: Chronological Reading
-        - Read through messages sequentially, tracking conversational context
-        - Note timestamps and identify any significant time gaps
-        - Track participants and their roles throughout the conversation
-
-        ### Step 2: Context Tracking
-        - Identify the main issue or topic being discussed in each segment
-        - Note when new topics are introduced vs. when existing topics are continued
-        - Distinguish between clarifications/follow-ups vs. entirely new issues
-
-        ### Step 3: Boundary Detection
-        - Apply primary boundary indicators to identify potential case breaks
-        - Validate boundaries using secondary indicators
-        - Ensure each identified case has a clear beginning and logical conclusion
-
-        ### Step 4: Case Validation
-        - Verify each case represents a complete, coherent interaction
-        - Ensure cases don't artificially split related conversations
-        - Confirm cases don't inappropriately merge distinct issues
-
-        ## Special Considerations
-
-        ### Message Type Analysis:
-        - **Greeting Messages**: Usually part of case initiation, not separate cases
-        - **Status Updates**: Continuation of existing cases unless introducing new issues
-        - **Follow-up Questions**: Part of the same case unless opening new topics
-        - **Closing/Thank You**: Usually case conclusion markers
-
-        ### Quality Thresholds:
-        - **High Confidence (0.8-1.0)**: Clear boundaries with obvious topic shifts, resolution points, or participant changes
-        - **Medium Confidence (0.5-0.8)**: Probable boundaries based on context shifts or timing, but some ambiguity exists
-        - **Low Confidence (0.3-0.5)**: Uncertain boundaries where segmentation is subjective or unclear
-
-        ## Case Extraction Guidelines
-
-        For each identified case, provide:
-        1. **Start Message**: Message number where the distinct case begins
-        2. **End Message**: Message number where the case concludes or transitions
-        3. **Summary**: Comprehensive 1-2 sentence summary including: initial problem, key actions taken, and final resolution status
-        4. **Confidence**: Assessment of boundary certainty based on analysis criteria above
-
-        ## Final Review and Adjustment
-
-        Before providing your final output, revisit your segmentation analysis:
-        - Review each identified case boundary for accuracy
-        - Check if any cases should be merged or split
-        - Verify that no distinct issues were missed
-        - Adjust confidence scores based on boundary clarity
-        - Ensure summaries accurately reflect the complete case content
-
-        ## Output Requirements
-
-        Return analysis in this EXACT JSON structure:
-
-        {{
-            "complete_cases": [
-                {{
-                    "start_message": 1,
-                    "end_message": 8,
-                    "summary": "Customer reported delivery issue with order #12345. Support investigated tracking and confirmed package was delivered to correct address, providing photo evidence. Issue resolved.",
-                    "confidence": 0.9
-                }}
-            ],
-            "analysis": "Comprehensive explanation incorporating business logic, customer journey insights, and boundary reasoning based on the 6-step systematic analysis",
-            "total_messages_analyzed": {len(messages)}
-        }}
-        </output>
-        """
-    
-        prompt2 = f"""
-
-        Analyze customer service conversations and segment them into separate cases by topic.
-
-        Segmentation Rules:
-        1. Clear topic change → New segment
-        2. Customer says "also", "another question", "by the way" → New segment  
-        3. New question after problem resolution → New segment
-        4. 24+ hour gap → New segment
-
-        Do NOT segment for:
-        - Follow-up clarifications on same issue
-        - Polite responses like "thank you"
-        - Information confirmations
-
-        <thinking>
-        Step 1: Read through the entire conversation chronologically to understand overall flow
-        Step 2: Identify main topics and issues discussed throughout the conversation
-        Step 3: Mark potential segment boundaries based on clear topic changes
-        Step 4: Check for explicit transition signals ("also", "another question", "by the way")
-        Step 5: Look for resolution points followed by new questions or issues
-        Step 6: Evaluate time gaps and assess whether they indicate natural conversation breaks
-        Step 7: Validate that each segment represents a coherent, actionable case
-        Step 8: Apply business logic to ensure segments make sense for case management
-        </thinking>
-
-
-        **CONVERSATION TO ANALYZE:**
-        {truncation_note}{self.format_conversation_for_llm(messages, was_truncated)}
-
-        Output segmentation results in JSON format:
-        <output>
-        {{
-            "complete_cases": [
-                {{
-                    "start_message": 1,
-                    "end_message": 8,
-                    "summary": "Brief description of the issue, actions taken, and resolution status",
-                    "confidence": 0.9
-                }}
-            ],
-            "analysis": "Comprehensive explanation incorporating business logic, customer journey insights, and boundary reasoning based on the systematic analysis above",
-            "total_messages_analyzed": [total_number_of_messages]
-        }}
-        </output>
-        """
-        
-        prompt3 = f"""
-# CUSTOMER SERVICE CONVERSATION CASE SEGMENTATION
-
-## ROLE & OBJECTIVE
-You are an expert conversation analyst specializing in customer service case segmentation. Your task is to analyze a continuous stream of customer service messages and segment them into distinct "cases" based on topic changes and conversation flow interruptions.
-
-## CONVERSATION DATA
-<csv_content>
-{self.format_conversation_for_llm(messages, was_truncated)}
-</csv_content>
-
-## DATA STRUCTURE
-**Focus on these key columns:**
-- **created_time**: Message timestamp (YYYY-MM-DDTHH:MM:SS format)
-- **sender_id**: Unique identifier for the message sender
-- **message**: The actual message content
-- **sender_type**: Either "customer_service" or "user"
-
-*Note: Ignore all other columns in your analysis.*
-
----
-
-## SEGMENTATION METHODOLOGY: Attention Queue Processing
-
-### STEP-BY-STEP PROCESS:
-
-**1. INITIALIZE** → Start with an attention queue containing the first 5-10 messages
-
-**2. ANALYZE BATCH** → For the current message batch in your queue, determine:
-   - Is the current topic/conversation thread completed?
-   - Should this batch end a case, or continue gathering messages?
-
-**3. DECISION BRANCHING:**
-   
-   **IF TOPIC IS COMPLETED:**
-   - ✅ Finalize the current case
-   - 📝 Create case summary
-   - 🗑️ Remove completed case messages from queue
-   - ➕ Load next 5-10 messages into queue
-   
-   **IF TOPIC CONTINUES:**
-   - ➕ Add more messages to the current queue
-   - 🔄 Re-analyze the expanded batch
-
-**4. REPEAT** → Continue until all messages are processed
-
----
-
-## ANALYSIS FRAMEWORK
-
-For each potential case boundary, conduct this structured analysis:
-
-<case_segmentation_analysis>
-**1. Current batch:** [List message numbers currently in your attention queue]
-
-**2. Time gap assessment:** [Note any significant time gaps between messages and their implications]
-
-**3. Topic continuity indicators:** [Identify words/phrases that suggest the conversation continues the same topic]
-
-**4. Topic change indicators:** [Identify words/phrases that signal a new topic or case beginning]
-
-**5. Context analysis:** [Evaluate message context, flow, and conversation coherence]
-
-**6. Decision:** [STATE: "COMPLETE CURRENT CASE" or "CONTINUE GATHERING MESSAGES"]
-
-**7. Confidence level:** [Rate 1-10, where 10 = completely certain about the boundary decision]
-
-**8. Justification:** [Provide clear reasoning for your segmentation decision]
-</case_segmentation_analysis>
-
----
-
-## REQUIRED OUTPUT FORMAT
-
-After completing your systematic analysis, provide your final case segmentation in this **EXACT** JSON structure:
-
-<output>
-{{
-    "complete_cases": [
-        {{
-            "start_message": 1,
-            "end_message": 15,
-            "summary": "Brief summary of the case content and resolution",
-            "confidence": 0.9
-        }},
-        {{
-            "start_message": 16,
-            "end_message": 32,
-            "summary": "Brief summary of the next case content and resolution",
-            "confidence": 0.8
-        }}
-    ],
-    "analysis": "Comprehensive explanation of your segmentation decisions and reasoning",
-    "total_messages_analyzed": {len(messages)}
-}}
-</output>
-
----
-
-## CRITICAL REQUIREMENTS
-
-⚠️ **STRICT ADHERENCE REQUIRED:**
-- Use the attention queue batch processing approach described above
-- Provide detailed <case_segmentation_analysis> for each potential boundary
-- Follow the exact JSON output format with proper timestamp formatting
-- Focus on natural topic changes and conversation interruptions
-- Ensure each case represents a coherent, complete interaction thread
-
-**Success Criteria:** Accurate case boundaries that reflect natural conversation flow and topic changes, processed systematically through the attention queue methodology.
-        """
-        
-        prompt4 = f"""
-            You are an expert customer service conversation analyst. Your task is to segment conversations into meaningful, actionable cases for quality analysis and case management.
-
-            ## Core Objective
-            Create segments that represent coherent business issues that can be independently tracked, resolved, and analyzed. Each segment should tell a complete story from problem identification to resolution or handoff.
-
-            ## Segmentation Philosophy
-            Apply the "Business Value Test": Would creating separate cases here improve customer service operations, tracking, or analysis? If yes, segment. If it would fragment a coherent customer journey, keep together.
-
-            ## Decision Framework (Apply Holistically)
-
-            ### **Strong Segmentation Signals** (High likelihood of new segment):
-            - **Semantic Topic Shift**: Customer introduces fundamentally different subject matter
-            - **Intent Change**: Shift from complaint → inquiry → request → feedback
-            - **Resolution Boundary**: Clear problem closure ("thanks, that's fixed") + new issue
-            - **Explicit Transitions**: "Also", "another question", "by the way", "separately"
-            - **Temporal Disconnection**: 24+ hours with contextual break
-            - **Service Escalation**: Handoff to different department/specialist
-
-            ### **Weak Segmentation Signals** (Evaluate in context):
-            - **Clarification Requests**: "What do you mean by..." on same topic
-            - **Process Steps**: Multi-step troubleshooting or information gathering  
-            - **Status Updates**: Progress reports on ongoing issue
-            - **Politeness Markers**: "Thank you", "please", routine courtesy
-            - **Detail Expansion**: Providing additional information for same problem
-
-            ### **Anti-Segmentation Factors** (Keep together):
-            - **Causal Dependencies**: Second issue caused by or related to first
-            - **Context Continuity**: Ongoing narrative that loses meaning if split
-            - **Process Completion**: Incomplete workflows or pending resolutions
-            - **Customer Experience Flow**: Natural conversation progression
-
-            ## Advanced Analysis Techniques
-
-            ### **Temporal Context Weighting**:
-            - **0-4 hours**: Strong continuity assumption
-            - **4-24 hours**: Moderate continuity, check semantic relationship
-            - **24+ hours**: Weak continuity, evaluate independent business value
-
-            ### **Semantic Coherence Assessment**:
-            Ask: "Do these messages address the same underlying customer need or business process?" If unclear, err toward keeping together.
-
-            ### **Business Logic Validation**:
-            For each potential segment, verify:
-            - Can this be assigned to a specialist?
-            - Does it have clear success/failure criteria?
-            - Would a manager understand the scope by reading just this segment?
-
-            ## Quality Assurance Checks
-
-            Before finalizing segmentation:
-            1. **Completeness**: Does each segment contain sufficient context to be actionable?
-            2. **Independence**: Can segments be resolved by different agents simultaneously?
-            3. **Customer Perspective**: Does segmentation respect the customer's problem-solving journey?
-            4. **Operational Value**: Will this segmentation improve case management or analysis?
-
-            <thinking>
-            Step 1: **Holistic Reading** - Understand the complete customer journey and business context
-            Step 2: **Intent Mapping** - Identify distinct customer goals and service delivery processes
-            Step 3: **Boundary Identification** - Mark potential splits using the decision framework above
-            Step 4: **Context Evaluation** - For each boundary, apply business value test and anti-segmentation factors
-            Step 5: **Temporal Analysis** - Weight time gaps against semantic and business continuity
-            Step 6: **Quality Validation** - Ensure each segment meets completeness and independence criteria
-            Step 7: **Final Optimization** - Adjust boundaries to maximize operational value while preserving customer experience coherence
-            </thinking>
-
-            **CONVERSATION TO ANALYZE:**
-            {truncation_note}{self.format_conversation_for_llm(messages, was_truncated)}
-
-            Output segmentation results in JSON format:
-
-            {{
-                "complete_cases": [
-                    {{
-                        "start_message": 1,
-                        "end_message": 8,
-                        "summary": "Brief description of the issue, actions taken, and resolution status",
-                        "confidence": 0.9
-                    }}
-                ],
-                "total_messages_analyzed": [total_number_of_messages]
-            }}        
-        """
-        
-        prompt5 = f"""
+        # Create the analysis prompt
+        prompt = f"""
 You are an expert e-commerce customer service conversation analyst. Your task is to segment seller-support conversations into meaningful cases based on order context and business logic.
 
 ## Conversation Context
@@ -1034,7 +470,7 @@ Step 8: **Operational Optimization** - Create segments supporting efficient case
 </thinking>
 
 ### **CONVERSATION TO ANALYZE:**
-{truncation_note}{self.format_conversation_for_llm(messages, was_truncated)}
+{self.format_conversation_for_llm(messages)}
 
 ### Output segmentation results in JSON format:
 
@@ -1051,12 +487,42 @@ Step 8: **Operational Optimization** - Create segments supporting efficient case
 }}
 
         """
-        final_prompt = prompt5
-        return self._execute_llm_call(final_prompt, "initial analysis", messages)
+        
+        # Execute LLM analysis and parse response
+        response = self._execute_llm_call(prompt, "initial analysis", messages)
+        result = None
+        
+        if response:
+            parsed_result = self.parse_llm_response_json(response)
+            if parsed_result and self.validate_segmentation_response(parsed_result):
+                result = parsed_result
+        
+        # Create fallback if analysis failed
+        if result is None:
+            print("  ⚠️ Analysis failed, creating fallback single case")
+            result = {
+                "complete_cases": [{
+                    "start_message": 1,
+                    "end_message": len(messages),
+                    "summary": "LLM analysis failed - processed as single case",
+                    "confidence": 0.1
+                }],
+                "analysis": "LLM analysis failed",
+                "total_messages_analyzed": len(messages)
+            }
+        
+        # Log analysis results
+        cases = result.get("complete_cases", [])
+        if cases:
+            avg_confidence = sum(case.get("confidence", 0.0) for case in cases) / len(cases)
+            print(f"  🎯 Analysis complete: {len(cases)} cases, avg confidence: {avg_confidence:.3f}")
+        else:
+            print("  ⚠️ No cases identified in analysis")
+        
+        return result
     
-    
-    def _execute_llm_call(self, prompt: str, call_type: str, messages: List[Message] = None) -> Dict[str, Any]:
-        """Execute an LLM call with comprehensive error handling and debug dumping"""
+    def _execute_llm_call(self, prompt: str, call_type: str, messages: List[Message] = None):
+        """Execute LLM API call with logging and statistics tracking"""
         if messages is None:
             messages = []
             
@@ -1067,127 +533,170 @@ Step 8: **Operational Optimization** - Create segments supporting efficient case
             self._log_llm_interaction(call_type, prompt, response, messages, success=True)
             
             # Update statistics
-            self.current_channel_stats.input_tokens += response.input_tokens
-            self.current_channel_stats.output_tokens += response.output_tokens
-            self.current_channel_stats.llm_calls += 1
-            self.current_channel_stats.processing_time += response.processing_time
+            self.update_channel_stats(response)
             
             print(f"    📊 {call_type}: {response.input_tokens} input + {response.output_tokens} output tokens")
             
-            # Create context for debug dumps
-            response_context = {
-                "model": response.model,
-                "provider": response.provider,
-                "input_tokens": response.input_tokens,
-                "output_tokens": response.output_tokens,
-                "processing_time": f"{response.processing_time:.2f}s"
-            }
-            
-            # Enhanced JSON parsing with multiple strategies
-            try:
-                # Strategy 1: Direct JSON parsing
-                result = json.loads(response.content)
-                print(f"    ✅ {call_type}: Direct JSON parsing successful")
-                
-                # Validate the structure
-                if self.validate_llm_response(result):
-                    return result
-                else:
-                    print(f"    ⚠️ {call_type}: JSON structure invalid, missing complete_cases key")
-                    self._create_debug_dump("validation_failed", call_type, messages, prompt, 
-                                          response.content, "Direct JSON validation failed", response_context)
-                    raise ValueError("Invalid JSON structure")
-            except (json.JSONDecodeError, ValueError) as err:
-                print(f"    ⚠️ {call_type}: Direct JSON parsing failed: {err}")
-                
-                try:
-                    # Strategy 2: Extract JSON from mixed text response
-                    extracted_json = self.extract_json_from_response(response.content)
-                    result = json.loads(extracted_json)
-                    print(f"    ✅ {call_type}: Successfully extracted JSON from mixed response")
-                    
-                    # Validate the structure
-                    if self.validate_llm_response(result):
-                        return result
-                    else:
-                        print(f"    ⚠️ {call_type}: Extracted JSON structure invalid")
-                        self._create_debug_dump("extraction_validation_failed", call_type, messages, prompt, 
-                                              response.content, f"JSON extraction validation failed: {err}", response_context)
-                        raise ValueError("Invalid JSON structure")
-                except (json.JSONDecodeError, ValueError) as extract_err:
-                    print(f"    ⚠️ {call_type}: JSON extraction failed, trying cleaning...")
-                    
-                    try:
-                        # Strategy 3: Clean control characters and retry
-                        cleaned_response = self.clean_message_content(response.content)
-                        extracted_json = self.extract_json_from_response(cleaned_response)
-                        result = json.loads(extracted_json)
-                        print(f"    ✅ {call_type}: Successfully parsed with cleaned extraction")
-                        
-                        # Validate the structure
-                        if self.validate_llm_response(result):
-                            return result
-                        else:
-                            print(f"    ⚠️ {call_type}: Cleaned JSON structure invalid")
-                            self._create_debug_dump("clean_validation_failed", call_type, messages, prompt, 
-                                                  response.content, f"Cleaned JSON validation failed: {extract_err}", response_context)
-                            raise ValueError("Invalid JSON structure")
-                    except Exception as clean_err:
-                        print(f"    ❌ {call_type}: All JSON parsing strategies failed")
-                        
-                        # Comprehensive debug dump for complete parsing failure
-                        error_details = f"""
-Direct parsing error: {err}
-Extraction error: {extract_err}  
-Cleaning error: {clean_err}
-All parsing strategies exhausted.
-                        """.strip()
-                        
-                        self._create_debug_dump("complete_parsing_failed", call_type, messages, prompt, 
-                                              response.content, error_details, response_context)
-                        return None
-        
+            return response
         except Exception as e:
-            print(f"    ❌ {call_type} LLM call failed: {e}")
-            
-            # Log failed LLM interactions
-            error_details = f"LLM API call exception: {str(e)}\nException type: {type(e).__name__}"
-            self._log_llm_interaction(call_type, prompt, e, messages, success=False, error_details=error_details)
-            
-            # Check if exception has enhanced error response data
-            error_response = getattr(e, 'error_response', None)
-            
-            if error_response:
-                # Enhanced error with response details available
-                print(f"    📋 Enhanced error details available: finish_reason={error_response.finish_reason}")
-                
-                response_content = f"[ERROR_RESPONSE_CONTENT]\nFinish Reason: {error_response.finish_reason}\n"
-                if error_response.error_details:
-                    response_content += f"Error Details: {json.dumps(error_response.error_details, indent=2, default=str)}\n"
-                
-                response_context = {
-                    "model": error_response.model,
-                    "provider": error_response.provider,
-                    "input_tokens": error_response.input_tokens,
-                    "output_tokens": error_response.output_tokens,
-                    "processing_time": f"{error_response.processing_time:.2f}s",
-                    "finish_reason": error_response.finish_reason,
-                    "error_response_available": True
-                }
-                
-                error_details = f"LLM API call exception: {str(e)}\nException type: {type(e).__name__}\nEnhanced error response captured with finish_reason: {error_response.finish_reason}"
-                
-                self._create_debug_dump("api_call_failed_with_response", call_type, messages, prompt, 
-                                      response_content, error_details, response_context)
-            else:
-                # Standard error without response details
-                error_details = f"LLM API call exception: {str(e)}\nException type: {type(e).__name__}\nNo enhanced error response available"
-                self._create_debug_dump("api_call_failed", call_type, messages, prompt, 
-                                      "", error_details, {"exception_type": type(e).__name__})
+            self.handle_llm_api_error(e, call_type, prompt, messages)
             return None
     
-    def validate_llm_response(self, response_dict: Dict[str, Any]) -> bool:
-        """Validate that LLM response has the required structure"""
+    def review_case_segmentation(self, original_messages: List[Message], cases: List[Dict[str, Any]], 
+                                iteration: int = 0) -> List[CaseReviewResult]:
+        """Review case segmentation quality and suggest improvements"""
+        if not self.llm_manager:
+            print(f"    ⚠️ No LLM available for review - skipping")
+            return []
+        
+        print(f"    🔍 Reviewing {len(cases)} cases (iteration {iteration})...")
+        
+        review_results = []
+        
+        for case_idx, case_info in enumerate(cases):
+            start_idx = case_info["start_message"] - 1
+            end_idx = case_info["end_message"]
+            
+            # Extract case messages
+            if 0 <= start_idx < end_idx <= len(original_messages):
+                case_messages = original_messages[start_idx:end_idx]
+                
+                # Create review prompt for this specific case
+                review_prompt = f"""
+You are an expert case segmentation reviewer. Your task is to analyze a single case and determine if it should be split into multiple separate cases.
+
+## Case Analysis Guidelines
+
+### Strong Indicators for Splitting:
+- **Multiple distinct topics**: Different issues/problems being discussed
+- **Clear topic transitions**: "Also", "another question", "by the way", "separately"
+- **Resolution boundaries**: One issue resolved, then new issue starts
+- **Temporal disconnections**: Long time gaps with context breaks
+- **Different business processes**: Order issue → technical problem → billing inquiry
+
+### Keep Together (Do NOT split):
+- **Clarification requests**: Follow-up questions on same topic
+- **Multi-step processes**: Troubleshooting, information gathering
+- **Status updates**: Progress reports on ongoing issue
+- **Context continuity**: Related conversation flow
+
+## Case to Review (Messages {start_idx + 1} to {end_idx}):
+
+{self.format_conversation_for_llm(case_messages)}
+
+## Analysis Task
+
+Carefully analyze this case and determine:
+1. Does this case contain multiple distinct topics that should be separate cases?
+2. Are there clear boundary points where a split would make sense?
+3. Would splitting improve case management and tracking?
+
+## Required Response Format
+
+Return ONLY valid JSON in this exact format:
+
+{{
+    "needs_split": false,
+    "confidence": 0.9,
+    "reasoning": "Brief explanation of why this case should/shouldn't be split",
+    "suggested_split_points": []
+}}
+
+If needs_split is true, provide message numbers (1-indexed) where splits should occur in suggested_split_points array.
+
+Example: If case has messages 1-10 and should split after message 4 and 7:
+{{
+    "needs_split": true,
+    "confidence": 0.8,
+    "reasoning": "Contains three distinct topics: delivery issue (1-4), billing question (5-7), technical problem (8-10)",
+    "suggested_split_points": [4, 7]
+}}
+"""
+                
+                try:
+                    # Execute review analysis
+                    llm_response = self._execute_llm_call(review_prompt, f"case_review_{case_idx}_iter_{iteration}", case_messages)
+                    response = None
+                    if llm_response:
+                        response = self.parse_llm_response_json(llm_response)
+                        # Validate the result if parsing succeeded
+                        if response and not self.validate_review_response(response):
+                            response = None
+                    
+                    if response and response.get("needs_split") is not None:
+                        # Convert suggested split points to case-relative indices
+                        split_points = response.get("suggested_split_points", [])
+                        # Convert to message indices relative to the original conversation (LLM returns 1-based indices)
+                        absolute_split_points = [start_idx + sp - 1 for sp in split_points if 0 < sp <= len(case_messages)]
+                        
+                        review_result = CaseReviewResult(
+                            case_index=case_idx,
+                            needs_split=response.get("needs_split", False),
+                            confidence=response.get("confidence", 0.5),
+                            reasoning=response.get("reasoning", "No reasoning provided"),
+                            suggested_split_points=absolute_split_points,
+                            review_iteration=iteration
+                        )
+                        review_results.append(review_result)
+                        
+                        if review_result.needs_split:
+                            print(f"      🔄 Case {case_idx} flagged for splitting (conf: {review_result.confidence:.3f})")
+                        else:
+                            print(f"      ✅ Case {case_idx} approved (conf: {review_result.confidence:.3f})")
+                    else:
+                        print(f"      ⚠️ Case {case_idx} review failed - invalid response")
+                        
+                except Exception as e:
+                    print(f"      ❌ Case {case_idx} review error: {e}")
+                    continue
+        
+        return review_results
+    
+    def apply_review_splits(self, original_messages: List[Message], original_cases: List[Dict[str, Any]], 
+                           review_results: List[CaseReviewResult]) -> List[Dict[str, Any]]:
+        """Apply suggested splits from review results to create refined cases"""
+        refined_cases = []
+        
+        for case_idx, case_info in enumerate(original_cases):
+            # Find review result for this case
+            review_result = next((r for r in review_results if r.case_index == case_idx), None)
+            
+            if review_result and review_result.needs_split and review_result.suggested_split_points:
+                # Split this case
+                print(f"      ✂️ Splitting case {case_idx} at {len(review_result.suggested_split_points)} points")
+                
+                case_start = case_info["start_message"] - 1  # Convert to 0-based
+                case_end = case_info["end_message"]
+                
+                # Create split boundaries including case start/end
+                split_points = [case_start] + review_result.suggested_split_points + [case_end]
+                split_points = sorted(set(split_points))  # Remove duplicates and sort
+                
+                # Create new cases from split points
+                for i in range(len(split_points) - 1):
+                    split_start = split_points[i]
+                    split_end = split_points[i + 1]
+                    
+                    if split_start < split_end:
+                        # Extract messages for this split
+                        split_messages = original_messages[split_start:split_end]
+                        
+                        if split_messages:
+                            refined_case = {
+                                "start_message": split_start + 1,  # Convert back to 1-based
+                                "end_message": split_end,
+                                "summary": f"Reviewed case split {i+1} from original case {case_idx}: {case_info.get('summary', 'No summary')[:60]}...",
+                                "confidence": min(case_info.get("confidence", 0.5), review_result.confidence)  # Take minimum confidence
+                            }
+                            refined_cases.append(refined_case)
+            else:
+                # Keep original case unchanged
+                refined_cases.append(case_info)
+        
+        return refined_cases
+    
+    def validate_segmentation_response(self, response_dict: Dict[str, Any]) -> bool:
+        """Validate that segmentation LLM response has the required structure"""
         if not isinstance(response_dict, dict):
             return False
         
@@ -1208,6 +717,112 @@ All parsing strategies exhausted.
                 return False
         
         return True
+    
+    def validate_review_response(self, response_dict: Dict[str, Any]) -> bool:
+        """Validate that review LLM response has the required structure"""
+        if not isinstance(response_dict, dict):
+            return False
+        
+        # Check required fields for review response
+        required_fields = ["needs_split", "confidence", "reasoning"]
+        if not all(field in response_dict for field in required_fields):
+            return False
+        
+        # Validate field types
+        if not isinstance(response_dict["needs_split"], bool):
+            return False
+        
+        if not isinstance(response_dict["confidence"], (int, float)):
+            return False
+        
+        if not isinstance(response_dict["reasoning"], str):
+            return False
+        
+        # suggested_split_points should be a list if present
+        if "suggested_split_points" in response_dict:
+            if not isinstance(response_dict["suggested_split_points"], list):
+                return False
+        
+        return True
+        
+    def update_channel_stats(self, response):
+        """Update current channel statistics with LLM response data"""
+        if self.current_channel_stats and hasattr(response, 'input_tokens'):
+            self.current_channel_stats.input_tokens += response.input_tokens
+            self.current_channel_stats.output_tokens += response.output_tokens
+            self.current_channel_stats.llm_calls += 1
+            self.current_channel_stats.processing_time += response.processing_time
+    
+    def handle_llm_api_error(self, exception: Exception, call_type: str, prompt: str, messages: List[Message]) -> str:
+        """Handle LLM API call errors with simplified logging and debug dumps"""
+        print(f"    ❌ {call_type} failed: {exception}")
+        
+        # Simplified error details
+        error_details = f"{str(exception)}\nType: {type(exception).__name__}"
+        
+        # Log the interaction and get debug filename
+        debug_filename = self._log_llm_interaction(call_type, prompt, exception, messages, success=False, error_details=error_details)
+        
+        # Check for enhanced error response
+        error_response = getattr(exception, 'error_response', None)
+        
+        if error_response:
+            # Enhanced error with detailed response
+            print(f"    📋 Enhanced error: finish_reason={error_response.finish_reason}")
+            
+            response_content = f"[ERROR_RESPONSE]\nFinish Reason: {error_response.finish_reason}\n"
+            if error_response.error_details:
+                response_content += f"Details: {json.dumps(error_response.error_details, indent=2, default=str)}\n"
+            
+            response_context = {
+                "model": error_response.model,
+                "provider": error_response.provider,
+                "input_tokens": error_response.input_tokens,
+                "output_tokens": error_response.output_tokens,
+                "processing_time": f"{error_response.processing_time:.2f}s",
+                "finish_reason": error_response.finish_reason,
+                "error_response_available": True
+            }
+            
+            enhanced_error_details = f"{error_details}\nEnhanced error with finish_reason: {error_response.finish_reason}"
+            
+            self._create_debug_dump("api_call_failed_with_response", call_type, messages, prompt, 
+                                  response_content, enhanced_error_details, response_context)
+        else:
+            # Standard error without enhanced response
+            self._create_debug_dump("api_call_failed", call_type, messages, prompt, 
+                                  "", f"{error_details}\nNo enhanced error response available", 
+                                  {"exception_type": type(exception).__name__})
+        
+        print(f"    🔍 Debug logged: {debug_filename}")
+        return debug_filename
+    
+    def parse_llm_response_json(self, response):
+        """
+        Parse LLM response using 2-strategy approach.
+        
+        Args:
+            response: LLM response object containing content
+            
+        Returns:
+            Parsed JSON dict, or None if both strategies fail
+        """
+        response_content = response.content
+        
+        try:
+            # Strategy 1: Direct JSON parsing
+            result = json.loads(response_content)
+            return result
+        except json.JSONDecodeError:
+            try:
+                # Strategy 2: Extract JSON from mixed text response
+                extracted_json = self.extract_json_from_response(response_content)
+                result = json.loads(extracted_json)
+                return result
+            except (json.JSONDecodeError, Exception) as e:
+                # Both strategies failed
+                print(f"    ❌ JSON parsing failed: {type(e).__name__}: {str(e)}")
+                return None
     
     
     def _log_llm_interaction(self, call_type: str, prompt: str, response, messages: List[Message] = None, 
@@ -1320,75 +935,14 @@ All parsing strategies exhausted.
             print(f"    ⚠️ Failed to create debug dump: {debug_err}")
             return ""
 
-    def retry_llm_for_json(self, messages: List[Message], original_response: str = "") -> Dict[str, Any]:
-        """Retry LLM with more explicit JSON formatting instructions"""
-        print("  🔄 Retrying LLM with explicit JSON format request...")
-        
-        prompt = f"""
-The previous response was not in the correct JSON format. Please analyze this conversation and return ONLY a valid JSON object with this EXACT structure:
-
-{{
-    "complete_cases": [
-        {{
-            "start_message": 1,
-            "end_message": {len(messages)},
-            "summary": "Brief summary of the support case",
-            "confidence": 0.8
-        }}
-    ],
-    "analysis": "Brief analysis of the conversation",
-    "total_messages_analyzed": {len(messages)}
-}}
-
-If you cannot identify distinct cases, return a single case spanning all messages.
-
-Conversation to analyze:
-{self.format_conversation_for_llm(messages[:50])}
-
-IMPORTANT: Return ONLY the JSON object, no other text.
-"""
-        
-        try:
-            response = self.llm_manager.analyze_case_boundaries(prompt)
-            
-            # Log retry LLM interactions
-            self._log_llm_interaction("json_retry", prompt, response, messages, success=True)
-            
-            result = json.loads(response.content)
-            
-            if self.validate_llm_response(result):
-                print("  ✅ Retry successful - valid JSON structure received")
-                return result
-            else:
-                print("  ⚠️ Retry returned invalid structure")
-                self._create_debug_dump("retry_validation_failed", "json_retry", messages, 
-                                      prompt, response.content, "Retry response failed validation")
-                return None
-                
-        except Exception as e:
-            print(f"  ❌ Retry failed: {e}")
-            
-            # Log failed retry attempts
-            error_details = f"Retry exception: {str(e)}\nException type: {type(e).__name__}"
-            self._log_llm_interaction("json_retry", prompt, e, messages, success=False, error_details=error_details)
-            
-            self._create_debug_dump("retry_failed", "json_retry", messages, 
-                                  prompt, "", f"Retry exception: {str(e)}")
-            return None
-    
-    
     def extract_case(self, messages: List[Message], start_idx: int, end_idx: int, 
-                    confidence: float = 0.5, summary: str = "", is_last_case: bool = False, 
-                    was_truncated: bool = False) -> Case:
+                    confidence: float = 0.5, summary: str = "") -> Case:
         """Extract a case from the message list"""
         # Convert to 0-based indexing and slice messages
         case_messages = messages[start_idx:end_idx]
         
         # Calculate duration in minutes
         duration = (case_messages[-1].timestamp - case_messages[0].timestamp).total_seconds() / 60.0
-        
-        # Determine if this case is truncated (only last case can be truncated)
-        truncated = is_last_case and was_truncated
         
         case = Case(
             case_id=f"CASE_{self.case_counter:04d}",
@@ -1401,12 +955,8 @@ IMPORTANT: Return ONLY the JSON object, no other text.
             confidence=confidence,
             duration_minutes=duration,
             forced_ending=False,
-            forced_starting=False,
-            truncated=truncated
+            forced_starting=False
         )
-        
-        if truncated:
-            case.summary = f"{case.summary} (TRUNCATED - conversation may be incomplete)"
         
         self.case_counter += 1
         self.current_channel_stats.cases_found += 1
@@ -1421,7 +971,8 @@ IMPORTANT: Return ONLY the JSON object, no other text.
             print("  ⚠️ No messages in channel, skipping...")
             return []
         
-        # Initialize channel statistics
+        # Reset and initialize channel statistics (ensure clean state between channels)
+        self.current_channel_stats = None
         self.current_channel_stats = ChannelStats(
             channel_url=channel_url,
             total_messages=len(messages),
@@ -1429,50 +980,86 @@ IMPORTANT: Return ONLY the JSON object, no other text.
             input_tokens=0,
             output_tokens=0,
             llm_calls=0,
-            processing_time=0.0,
-            was_truncated=False
+            processing_time=0.0
         )
         
         channel_cases = []
         
-        # Step 1: Check if conversation fits in token limit
-        truncated_messages, was_truncated = self.truncate_conversation_to_fit(messages)
-        self.current_channel_stats.was_truncated = was_truncated
-        
-        # Step 2: Analyze the full (or truncated) conversation
-        analysis = self.analyze_full_conversation(truncated_messages, was_truncated)
-        
-        cases_found = len(analysis.get("complete_cases", []))
-        print(f"  🎯 LLM identified {cases_found} complete cases")
-        
-        # Step 3: Extract all identified cases
-        for case_info in analysis.get("complete_cases", []):
-            start_idx = case_info["start_message"] - 1  # Convert to 0-based
-            end_idx = case_info["end_message"]
+        try:
+            # Step 1: Analyze the full conversation
+            analysis = self.analyze_full_conversation(messages)
             
-            if 0 <= start_idx < end_idx <= len(truncated_messages):
-                # Check if this is the last case (for truncation marking)
-                is_last_case = (case_info == analysis["complete_cases"][-1])
+            initial_cases = analysis.get("complete_cases", [])
+            cases_found = len(initial_cases)
+            print(f"  🎯 LLM identified {cases_found} complete cases")
+            
+            # Step 2: Review and iteratively refine case segmentation
+            refined_cases = initial_cases
+            
+            if self.review_enabled and cases_found > 0:
+                print(f"  🔍 Starting iterative review process (max {self.max_review_iterations} iterations)...")
                 
-                confidence = case_info.get("confidence", 0.5)
-                case = self.extract_case(
-                    truncated_messages, start_idx, end_idx, 
-                    confidence, case_info["summary"], is_last_case, was_truncated
-                )
-                channel_cases.append(case)
-                print(f"    ✅ Extracted case {case.case_id} (conf: {confidence:.3f}): {case.summary[:60]}...")
-        
-        # Classification removed - now handled as separate step
-        
-        # Store channel statistics
-        self.channel_stats[channel_url] = self.current_channel_stats
+                for iteration in range(self.max_review_iterations):
+                    # Review current cases
+                    review_results = self.review_case_segmentation(messages, refined_cases, iteration)
+                    
+                    # Check if any cases need splitting
+                    cases_needing_split = [r for r in review_results if r.needs_split]
+                    
+                    if not cases_needing_split:
+                        print(f"    ✅ Review complete: No cases need further splitting (iteration {iteration})")
+                        self.current_channel_stats.review_iterations = iteration
+                        break
+                    else:
+                        print(f"    🔄 Iteration {iteration}: {len(cases_needing_split)} cases flagged for splitting")
+                        
+                        # Apply splits to create refined cases
+                        refined_cases = self.apply_review_splits(messages, refined_cases, review_results)
+                        
+                        # Update statistics
+                        self.current_channel_stats.cases_reviewed += len(review_results)
+                        self.current_channel_stats.cases_split += len(cases_needing_split)
+                        self.current_channel_stats.review_iterations = iteration + 1
+                        
+                        print(f"    📊 After splits: {len(refined_cases)} total cases")
+                        
+                        # If this is the last iteration, break
+                        if iteration == self.max_review_iterations - 1:
+                            print(f"    ⏹️ Maximum iterations reached ({self.max_review_iterations})")
+                
+                print(f"  🎯 Review complete: {len(initial_cases)} → {len(refined_cases)} cases")
+            else:
+                print(f"  ⚠️ Review disabled or no cases to review")
+            
+            # Step 3: Extract all refined cases
+            for case_info in refined_cases:
+                start_idx = case_info["start_message"] - 1  # Convert to 0-based
+                end_idx = case_info["end_message"]
+                
+                if 0 <= start_idx < end_idx <= len(messages):
+                    confidence = case_info.get("confidence", 0.5)
+                    case = self.extract_case(
+                        messages, start_idx, end_idx, 
+                        confidence, case_info["summary"]
+                    )
+                    channel_cases.append(case)
+                    print(f"    ✅ Extracted case {case.case_id} (conf: {confidence:.3f}): {case.summary[:60]}...")
+            
+            # Classification removed - now handled as separate step
+            
+        finally:
+            # Always store channel statistics even if processing fails
+            if self.current_channel_stats:
+                self.channel_stats[channel_url] = self.current_channel_stats
         
         print(f"🎉 Channel complete: {len(channel_cases)} cases found")
         print(f"📊 Token usage: {self.current_channel_stats.input_tokens} input, {self.current_channel_stats.output_tokens} output")
         print(f"🤖 LLM calls: {self.current_channel_stats.llm_calls}")
         print(f"⏱️  Processing time: {self.current_channel_stats.processing_time:.2f}s")
-        if was_truncated:
-            print(f"⚠️  Conversation was truncated to fit token limits")
+        if self.current_channel_stats.review_iterations > 0:
+            print(f"🔍 Review iterations: {self.current_channel_stats.review_iterations}")
+            print(f"📋 Cases reviewed: {self.current_channel_stats.cases_reviewed}")
+            print(f"✂️  Cases split: {self.current_channel_stats.cases_split}")
         
         return channel_cases
     
@@ -1507,7 +1094,6 @@ IMPORTANT: Return ONLY the JSON object, no other text.
         output_df['case_duration_minutes'] = 0.0
         output_df['case_confidence'] = 0.0
         output_df['case_summary'] = ''
-        output_df['case_truncated'] = False
         output_df['case_forced_ending'] = False
         output_df['case_forced_starting'] = False
         
@@ -1528,7 +1114,6 @@ IMPORTANT: Return ONLY the JSON object, no other text.
                 output_df.at[i, 'case_duration_minutes'] = case.duration_minutes
                 output_df.at[i, 'case_confidence'] = case.confidence
                 output_df.at[i, 'case_summary'] = case.summary
-                output_df.at[i, 'case_truncated'] = case.truncated
                 output_df.at[i, 'case_forced_ending'] = case.forced_ending
                 output_df.at[i, 'case_forced_starting'] = case.forced_starting
         
@@ -1581,9 +1166,11 @@ IMPORTANT: Return ONLY the JSON object, no other text.
                 "low_confidence": len([c for c in self.completed_cases if c.confidence < 0.5])
             }
             
-            # Truncation statistics
-            truncated_cases = len([c for c in self.completed_cases if c.truncated])
-            truncated_channels = len([c for c in self.channel_stats.values() if c.was_truncated])
+            # Review statistics
+            total_review_iterations = sum(stats.review_iterations for stats in self.channel_stats.values())
+            total_cases_reviewed = sum(stats.cases_reviewed for stats in self.channel_stats.values())
+            total_cases_split = sum(stats.cases_split for stats in self.channel_stats.values())
+            channels_with_review = len([c for c in self.channel_stats.values() if c.review_iterations > 0])
             
             self._cached_total_stats = {
                 "total_cases": len(self.completed_cases),
@@ -1595,8 +1182,10 @@ IMPORTANT: Return ONLY the JSON object, no other text.
                 "total_processing_time": total_processing_time,
                 "average_confidence": avg_confidence,
                 "confidence_distribution": confidence_distribution,
-                "truncated_cases": truncated_cases,
-                "truncated_channels": truncated_channels
+                "total_review_iterations": total_review_iterations,
+                "total_cases_reviewed": total_cases_reviewed,
+                "total_cases_split": total_cases_split,
+                "channels_with_review": channels_with_review
             }
             self._cache_invalidated = False
             
@@ -1632,9 +1221,7 @@ IMPORTANT: Return ONLY the JSON object, no other text.
         content += f"**Algorithm:** Channel Full Conversation\n"
         content += f"**Total Cases Found:** {total_stats['total_cases']}\n"
         content += f"**Total Channels Processed:** {total_stats['total_channels']}\n"
-        content += f"**Average Confidence:** {total_stats['average_confidence']:.3f}\n"
-        content += f"**Truncated Channels:** {total_stats['truncated_channels']}\n"
-        content += f"**Truncated Cases:** {total_stats['truncated_cases']}\n\n"
+        content += f"**Average Confidence:** {total_stats['average_confidence']:.3f}\n\n"
         
         # Use cached confidence distribution
         confidence_dist = total_stats['confidence_distribution']
@@ -1645,20 +1232,25 @@ IMPORTANT: Return ONLY the JSON object, no other text.
         content += f"- **Medium Confidence (0.5-0.8):** {confidence_dist['medium_confidence']} cases ({confidence_dist['medium_confidence']/total_cases*100:.1f}%)\n"
         content += f"- **Low Confidence (<0.5):** {confidence_dist['low_confidence']} cases ({confidence_dist['low_confidence']/total_cases*100:.1f}%)\n\n"
         
-        content += "## Truncation Analysis\n\n"
-        truncated_cases = total_stats['truncated_cases']
-        truncated_channels = total_stats['truncated_channels']
-        content += f"- **Truncated Channels:** {truncated_channels} channels\n"
-        content += f"- **Truncated Cases:** {truncated_cases} cases ({truncated_cases/total_cases*100:.1f}%)\n"
-        if truncated_cases > 0:
-            content += f"- **Note:** Truncated cases may be incomplete due to token limit constraints\n"
+        content += "## Review Analysis\n\n"
+        total_review_iterations = total_stats['total_review_iterations']
+        total_cases_reviewed = total_stats['total_cases_reviewed']
+        total_cases_split = total_stats['total_cases_split']
+        channels_with_review = total_stats['channels_with_review']
+        
+        content += f"- **Review Enabled:** {'Yes' if self.review_enabled else 'No'}\n"
+        content += f"- **Channels with Review:** {channels_with_review} out of {total_stats['total_channels']}\n"
+        content += f"- **Total Review Iterations:** {total_review_iterations}\n"
+        content += f"- **Cases Reviewed:** {total_cases_reviewed}\n"
+        content += f"- **Cases Split After Review:** {total_cases_split}\n"
+        if total_cases_split > 0 and total_cases_reviewed > 0:
+            content += f"- **Split Rate:** {total_cases_split/total_cases_reviewed*100:.1f}% of reviewed cases were split\n"
         content += "\n"
         
         # All segmentations table
         content += "## All Case Segmentations\n\n"
-        content += "**Legend:** ⚠️ = Truncated\n\n"
-        content += "| Case ID | Channel | Start Time | End Time | Duration | Confidence | Truncated | Summary |\n"
-        content += "|---------|---------|------------|----------|----------|------------|-----------|----------|\n"
+        content += "| Case ID | Channel | Start Time | End Time | Duration | Confidence | Summary |\n"
+        content += "|---------|---------|------------|----------|----------|------------|----------|\n"
         
         # Use cached sorted cases
         for case in self.sorted_cases:
@@ -1667,10 +1259,9 @@ IMPORTANT: Return ONLY the JSON object, no other text.
             end_time = case.end_time.strftime('%Y-%m-%d %H:%M:%S')
             duration = f"{case.duration_minutes:.1f}m"
             confidence = f"{case.confidence:.3f}"
-            truncated_indicator = "⚠️" if case.truncated else "-"
             summary = case.summary[:40] + "..." if len(case.summary) > 40 else case.summary
             
-            content += f"| {case.case_id} | {short_channel} | {start_time} | {end_time} | {duration} | {confidence} | {truncated_indicator} | {summary} |\n"
+            content += f"| {case.case_id} | {short_channel} | {start_time} | {end_time} | {duration} | {confidence} | {summary} |\n"
         
         content += "\n"
         
@@ -1688,19 +1279,26 @@ IMPORTANT: Return ONLY the JSON object, no other text.
             short_channel = channel_url.split('_')[-1][:20]
             avg_conf = sum(c.confidence for c in cases) / len(cases)
             total_duration = sum(c.duration_minutes for c in cases)
-            was_truncated = self.channel_stats[channel_url].was_truncated
             
             content += f"### Channel: {short_channel}...\n\n"
             content += f"- **Cases:** {len(cases)}\n"
             content += f"- **Average Confidence:** {avg_conf:.3f}\n"
             content += f"- **Total Duration:** {total_duration:.1f} minutes\n"
-            content += f"- **Was Truncated:** {'Yes' if was_truncated else 'No'}\n"
+            
+            # Add review information for this channel
+            channel_stats = self.channel_stats[channel_url]
+            if channel_stats.review_iterations > 0:
+                content += f"- **Review Iterations:** {channel_stats.review_iterations}\n"
+                content += f"- **Cases Reviewed:** {channel_stats.cases_reviewed}\n"
+                content += f"- **Cases Split:** {channel_stats.cases_split}\n"
+            else:
+                content += f"- **Review Status:** No review performed\n"
+            
             content += f"- **Full URL:** `{channel_url}`\n\n"
             
             for case in sorted(cases, key=lambda x: x.start_time):
                 time_span = f"{case.start_time.strftime('%Y-%m-%d %H:%M:%S')} - {case.end_time.strftime('%Y-%m-%d %H:%M:%S')}"
-                truncated_note = " [TRUNCATED]" if case.truncated else ""
-                content += f"  - **{case.case_id}** ({time_span}, {case.duration_minutes:.1f}m, conf: {case.confidence:.3f}){truncated_note}: {case.summary}\n"
+                content += f"  - **{case.case_id}** ({time_span}, {case.duration_minutes:.1f}m, conf: {case.confidence:.3f}): {case.summary}\n"
             content += "\n"
         
         # Recommendations using cached stats
@@ -1717,9 +1315,6 @@ IMPORTANT: Return ONLY the JSON object, no other text.
         
         if low_conf > total_cases * 0.3:
             content += f"⚠️ **Warning:** {low_conf} cases ({low_conf/total_cases*100:.1f}%) have low confidence. Manual review recommended.\n\n"
-        
-        if truncated_cases > 0:
-            content += f"⚠️ **Truncation Warning:** {truncated_cases} cases were truncated. Consider increasing token limits or splitting long conversations.\n\n"
         
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(content)

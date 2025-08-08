@@ -49,7 +49,9 @@
     },
     "channel_algorithm": {
       "max_context_tokens": 128000,
-      "reserve_tokens": 2000
+      "reserve_tokens": 2000,
+      "review_enabled": true,
+      "max_review_iterations": 3
     }
   },
   "output": {
